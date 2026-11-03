@@ -25,7 +25,7 @@ class StubLLM(BaseAgentLLM):
         iteration: int = 0,
         subtask_results: Optional[List[SubtaskResult]] = None
     ) -> ResearchPlan:
-        await get_llm_rate_limiter().acquire()
+        await get_llm_rate_limiter().acquire(model="stub-model")
         words = [w for w in re.findall(r"\w+", task) if len(w) > 3]
         topic = " ".join(words[:4]) if words else "Target Domain"
 
@@ -114,7 +114,7 @@ class StubLLM(BaseAgentLLM):
         critic_evaluation: Optional[CriticEvaluation] = None,
         iteration: int = 0
     ) -> Tuple[str, StructuredReport]:
-        await get_llm_rate_limiter().acquire()
+        await get_llm_rate_limiter().acquire(model="stub-model")
 
         sections = []
         open_gaps = []
@@ -177,7 +177,7 @@ class StubLLM(BaseAgentLLM):
         deterministic_metrics: Optional[Dict[str, Any]] = None,
         structured_report: Optional[StructuredReport] = None
     ) -> CriticEvaluation:
-        await get_llm_rate_limiter().acquire()
+        await get_llm_rate_limiter().acquire(model="stub-model")
         if iteration == 0:
             coverage = CriticRubricScore(
                 dimension="Coverage",

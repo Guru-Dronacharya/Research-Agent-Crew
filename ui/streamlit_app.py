@@ -222,6 +222,18 @@ if result:
     if result.get("human_escalation_needed"):
         st.warning(f"⚠️ **Human Review Recommended**: {result.get('escalation_reason')}")
 
+    search_alerts = [
+        ev for ev in result.get("trace_events", [])
+        if ev.event_type == "tool_result"
+        and ev.details.get("tool_name") == "search_web"
+        and ev.details.get("status") in ("rate_limited", "timeout", "error")
+    ]
+    if search_alerts:
+        with st.expander(f"⚠️ Search Diagnostic Alerts ({len(search_alerts)})", expanded=False):
+            for alert in search_alerts:
+                status_label = alert.details.get("status", "alert").upper()
+                st.warning(f"**[{status_label}]** {alert.summary}")
+
     # Tabs for detailed inspection
     tab_report, tab_trace, tab_critic, tab_sources = st.tabs([
         "📄 Final Research Report",

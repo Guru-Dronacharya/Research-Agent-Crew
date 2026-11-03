@@ -21,7 +21,7 @@ from core.state import (
 )
 from core.report_render import validate_structured_report, render_structured_report_to_markdown
 from core.timing import record_llm_call_timing
-from core.ratelimit import get_llm_rate_limiter
+from core.ratelimit import get_llm_rate_limiter, QuotaExceededError, get_daily_quota_tracker
 
 
 class ConfigurationError(RuntimeError):
@@ -30,8 +30,21 @@ class ConfigurationError(RuntimeError):
 
 
 def _is_transient_error(exc: BaseException) -> bool:
-    """Detect transient 429 / rate limit / network / server errors."""
+    """Detect transient 429 / rate limit / network / server errors.
+
+    Returns False for QuotaExceededError or long-delay daily quota 429s (> 60s).
+    """
+    if isinstance(exc, QuotaExceededError):
+        return False
+
+    delay = _extract_retry_after(exc)
+    if delay is not None and delay > 60.0:
+        return False
+
     msg = str(exc).lower()
+    if "per day" in msg or "daily" in msg and "quota" in msg:
+        return False
+
     transient_indicators = [
         "429", "rate limit", "resource_exhausted", "resourceexhausted",
         "quota", "503", "500", "overloaded", "temporary", "timeout",
@@ -154,17 +167,36 @@ class GeminiAgentLLM(BaseAgentLLM):
         self.llm = ChatGoogleGenerativeAI(
             model=self.model_name,
             google_api_key=self.api_key,
-            temperature=self.temperature
+            temperature=self.temperature,
+            max_retries=0
         )
 
     async def _invoke_structured(self, schema_cls: Any, prompt: str) -> Any:
         """Invoke LLM with structured output, handling parsing_error with single retry."""
-        await get_llm_rate_limiter().acquire()
         structured_llm = self.llm.with_structured_output(schema_cls, include_raw=True)
 
         @llm_retry
         async def _call_once():
-            return await structured_llm.ainvoke(prompt)
+            # Acquire slot and count attempt against persistent daily quota counter
+            await get_llm_rate_limiter().acquire(model=self.model_name)
+            try:
+                return await structured_llm.ainvoke(prompt)
+            except Exception as exc:
+                delay = _extract_retry_after(exc)
+                msg = str(exc).lower()
+                is_daily_mention = "per day" in msg or "daily" in msg and "quota" in msg
+                is_quota_429 = ("429" in msg or "resource_exhausted" in msg or "quota" in msg) and (
+                    (delay is not None and delay > 60.0) or is_daily_mention
+                )
+                if is_quota_429:
+                    tracker = get_daily_quota_tracker()
+                    tracker.set_quota_exhausted(self.model_name)
+                    reset_time_str = tracker.get_reset_time_description()
+                    raise QuotaExceededError(
+                        f"Google Gemini daily quota exceeded for model '{self.model_name}' (retry delay: {delay if delay is not None else 'N/A'}). {reset_time_str}.",
+                        reset_time=reset_time_str
+                    ) from exc
+                raise
 
         result_dict = await _call_once()
 

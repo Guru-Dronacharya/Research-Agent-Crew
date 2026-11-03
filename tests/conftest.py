@@ -18,6 +18,7 @@ def configure_test_environment(monkeypatch):
     monkeypatch.setenv("LLM_RPM", "6000")
     monkeypatch.setenv("SEARCH_RPM", "6000")
     monkeypatch.setenv("CACHE_ENABLED", "false")
+    monkeypatch.setenv("QUOTA_DB_PATH", ".cache/test_quota.db")
     reset_rate_limiters()
     stub = StubLLM()
     set_global_llm(stub)

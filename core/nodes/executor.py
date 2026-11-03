@@ -171,6 +171,11 @@ async def _execute_single_subtask(
             status = call_res.get("status", "error")
             duration_ms = call_res.get("duration_ms", 0.0)
             output = call_res.get("output", {})
+            err_msg = ""
+            if isinstance(output, dict):
+                err_msg = output.get("message") or output.get("error") or ""
+            elif isinstance(output, str):
+                err_msg = output
 
             record_tool_call_timing(
                 state_timings,
@@ -180,12 +185,13 @@ async def _execute_single_subtask(
             )
 
             if status == "timeout":
+                detail_str = f": {err_msg}" if err_msg else f" after {timeout_sec}s"
                 subtask_trace_events.append(
                     TraceLogger.log_tool_result(
                         tool_name="search_web",
                         status="timeout",
                         duration_ms=duration_ms,
-                        result_summary=f"Search timed out after {timeout_sec}s for query '{query}'",
+                        result_summary=f"Search timed out for query '{query}'{detail_str}",
                         subtask_id=subtask.id,
                         raw_result=output,
                         iteration=iteration
@@ -193,12 +199,13 @@ async def _execute_single_subtask(
                 )
                 continue
             elif status == "rate_limited":
+                detail_str = f": {err_msg}" if err_msg else ""
                 subtask_trace_events.append(
                     TraceLogger.log_tool_result(
                         tool_name="search_web",
                         status="rate_limited",
                         duration_ms=duration_ms,
-                        result_summary=f"Search rate limited (429/202) for query '{query}'",
+                        result_summary=f"Search rate-limited (429/202) for query '{query}'{detail_str}",
                         subtask_id=subtask.id,
                         raw_result=output,
                         iteration=iteration
@@ -206,12 +213,13 @@ async def _execute_single_subtask(
                 )
                 continue
             elif status == "error":
+                detail_str = f": {err_msg}" if err_msg else ""
                 subtask_trace_events.append(
                     TraceLogger.log_tool_result(
                         tool_name="search_web",
                         status="error",
                         duration_ms=duration_ms,
-                        result_summary=f"Search failed for query '{query}'",
+                        result_summary=f"Search failed for query '{query}'{detail_str}",
                         subtask_id=subtask.id,
                         raw_result=output,
                         iteration=iteration
@@ -219,7 +227,7 @@ async def _execute_single_subtask(
                 )
                 continue
 
-            # Cache successful or clean zero-results outcomes
+            # Cache successful or clean zero-results outcomes (never error, timeout, or rate_limited)
             if isinstance(output, dict) and output.get("status") in ("success", "no_results"):
                 await cache.set(query, output, max_results=3, provider="all")
 
@@ -355,12 +363,23 @@ async def _execute_single_subtask(
                     )
 
                     results_list = output.get("results", []) if isinstance(output, dict) else []
+                    fb_status = call_res.get("status", "unknown")
+                    fb_msg = output.get("message") or output.get("error") if isinstance(output, dict) else str(output)
+                    if fb_status == "error":
+                        summary_str = f"Search error for fallback '{fallback_query}': {fb_msg}"
+                    elif fb_status == "rate_limited":
+                        summary_str = f"Search rate-limited for fallback '{fallback_query}': {fb_msg}"
+                    elif fb_status == "timeout":
+                        summary_str = f"Search timed out for fallback '{fallback_query}': {fb_msg}"
+                    else:
+                        summary_str = f"Returned {len(results_list)} results for fallback query"
+
                     subtask_trace_events.append(
                         TraceLogger.log_tool_result(
                             tool_name="search_web",
-                            status=call_res.get("status", "unknown"),
+                            status=fb_status,
                             duration_ms=duration_ms,
-                            result_summary=f"Returned {len(results_list)} results",
+                            result_summary=summary_str,
                             subtask_id=subtask.id,
                             raw_result=output if isinstance(output, dict) else str(output)[:300],
                             iteration=iteration

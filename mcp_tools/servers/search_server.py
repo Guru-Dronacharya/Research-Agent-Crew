@@ -185,11 +185,19 @@ def _search_ddg(query: str, max_results: int, timeout: float = 6.0) -> List[Dict
             except Exception:
                 kwargs["backend"] = backends
 
-            raw_gen = ddgs_inst.text(query, **kwargs)
-            for item in raw_gen:
-                results.append(item)
-                if (time.perf_counter() - start_t) >= effective_timeout:
-                    break
+            try:
+                raw_gen = ddgs_inst.text(query, **kwargs)
+                for item in raw_gen:
+                    results.append(item)
+                    if (time.perf_counter() - start_t) >= effective_timeout:
+                        break
+            except Exception as exc:
+                msg = str(exc).lower()
+                if "no results found" in msg:
+                    # Clean zero results from DDGS backend
+                    pass
+                else:
+                    raise
 
     formatted = []
     for r in results:
@@ -261,13 +269,20 @@ def search_web(query: str, max_results: int = 5, timeout_sec: Optional[float] = 
             engine_used = "duckduckgo"
             provider_called_and_succeeded = True
         except Exception as exc:
+            msg = str(exc)
             if _is_rate_limit_error(exc):
                 last_status = "rate_limited"
+                last_error = f"DDG rate-limited: {msg}"
             elif _is_timeout_error(exc):
                 last_status = "timeout"
+                last_error = f"DDG timed out: {msg}"
+            elif "no results found" in msg.lower():
+                raw_results = []
+                engine_used = "duckduckgo"
+                provider_called_and_succeeded = True
             else:
                 last_status = "error"
-            last_error = f"DDG error: {str(exc)}"
+                last_error = f"DDG error: {msg}"
 
     # Apply relevance prefilter
     if raw_results:

@@ -6,7 +6,6 @@ asyncio.to_thread, latency tracking, and error resilience.
 """
 
 import os
-import sys
 import json
 import time
 import asyncio

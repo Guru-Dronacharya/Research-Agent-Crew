@@ -91,3 +91,92 @@ async def test_quota_exceeded_graph_graceful_escalation(monkeypatch):
     assert final_state["status"] in ("escalated", "finished", "completed")
     # Verify finalizer still produced scorecard with human review warning
     assert "Human Review Recommended" in (final_state.get("final_report") or "")
+
+
+@pytest.mark.asyncio
+async def test_concurrent_increments_never_exceed_limit(tmp_path):
+    """Concurrent increment calls must never exceed LLM_RPD limit."""
+    import asyncio
+    from core.ratelimit import DailyModelQuotaTracker
+
+    db_file = str(tmp_path / "concurrent_quota.db")
+    tracker = DailyModelQuotaTracker(db_path=db_file)
+    rpd_limit = 5
+    num_callers = 15
+
+    succeeded = 0
+    failed = 0
+
+    async def _try_increment():
+        nonlocal succeeded, failed
+        try:
+            await asyncio.to_thread(tracker.check_and_increment, "concurrent-model", rpd_limit)
+            succeeded += 1
+        except QuotaExceededError:
+            failed += 1
+
+    tasks = [_try_increment() for _ in range(num_callers)]
+    await asyncio.gather(*tasks)
+
+    assert succeeded == rpd_limit
+    assert failed == (num_callers - rpd_limit)
+    assert tracker.get_count("concurrent-model") == rpd_limit
+
+
+def test_counter_survives_a_restart(tmp_path):
+    """Per-model count in SQLite must persist across process / instance restarts."""
+    from core.ratelimit import DailyModelQuotaTracker
+
+    db_file = str(tmp_path / "persistent_quota.db")
+    tracker1 = DailyModelQuotaTracker(db_path=db_file)
+    tracker1.check_and_increment("model-alpha", rpd_limit=10)
+    tracker1.check_and_increment("model-alpha", rpd_limit=10)
+    tracker1.check_and_increment("model-alpha", rpd_limit=10)
+    assert tracker1.get_count("model-alpha") == 3
+
+    # Simulate restart by creating brand new instance pointing to same DB file
+    tracker2 = DailyModelQuotaTracker(db_path=db_file)
+    assert tracker2.get_count("model-alpha") == 3
+    new_count = tracker2.check_and_increment("model-alpha", rpd_limit=10)
+    assert new_count == 4
+    assert tracker2.get_count("model-alpha") == 4
+
+
+def test_429_with_long_delay_is_not_retried():
+    """Errors with retryDelay > 60s (daily quota exhaustion) are classified as non-transient."""
+    from core.llm import _is_transient_error
+
+    class MockLongDelayError(Exception):
+        pass
+
+    # 120s delay (> 60s) -> Daily quota exhaustion, NOT transient
+    long_delay_err = MockLongDelayError("RESOURCE_EXHAUSTED: retryDelay: 120s")
+    assert _is_transient_error(long_delay_err) is False
+
+    # 15s delay (<= 60s) -> Transient rate limit, retryable
+    short_delay_err = MockLongDelayError("RESOURCE_EXHAUSTED: retryDelay: 15s")
+    assert _is_transient_error(short_delay_err) is True
+
+
+def test_daily_quota_429_sets_counter_to_limit(tmp_path):
+    """When a daily quota 429 occurs, local counter is set to limit so subsequent calls fail fast."""
+    from core.ratelimit import DailyModelQuotaTracker
+
+    db_file = str(tmp_path / "fail_fast_quota.db")
+    tracker = DailyModelQuotaTracker(db_path=db_file)
+    model = "gemini-pro-test"
+
+    # Counter initially 1
+    tracker.check_and_increment(model, rpd_limit=50)
+    assert tracker.get_count(model) == 1
+
+    # Simulate daily 429 trigger: set quota exhausted to 50
+    tracker.set_quota_exhausted(model, limit=50)
+    assert tracker.get_count(model) >= 50
+
+    # Next attempt fails fast locally without making an external call
+    with pytest.raises(QuotaExceededError) as exc_info:
+        tracker.check_and_increment(model, rpd_limit=50)
+    assert "Daily quota exceeded" in str(exc_info.value)
+    assert tracker.get_reset_time_description() in str(exc_info.value)
+
