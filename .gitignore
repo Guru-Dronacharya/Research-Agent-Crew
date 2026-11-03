@@ -1,0 +1,30 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Pytest & telemetry
+.pytest_cache/
+.coverage
+htmlcov/
+.cache/
+*.db
+
+# Environment configurations
+.env
+*.env.local
+
+# Reports artifacts (keep .gitkeep)
+reports/*
+!reports/.gitkeep
+
+# OS generated files
+.DS_Store
+Thumbs.db
+desktop.ini

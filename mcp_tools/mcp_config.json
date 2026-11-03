@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "search": {
+      "command": "python",
+      "args": ["-m", "mcp_tools.servers.search_server"],
+      "description": "Web search and query rephrasing MCP server with Tavily, Brave, and DDG support"
+    },
+    "filesystem": {
+      "command": "python",
+      "args": ["-m", "mcp_tools.servers.fs_server"],
+      "description": "Filesystem MCP server for persisting and inspecting research reports"
+    }
+  }
+}

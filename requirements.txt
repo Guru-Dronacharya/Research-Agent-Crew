@@ -1,0 +1,20 @@
+# Research Agent Crew Dependencies
+langgraph>=1.2.11
+langchain-core>=1.6.3
+langchain-groq>=1.1.0
+groq>=0.37.0
+langchain-google-genai>=4.4.0
+google-genai>=2.24.0
+mcp>=2.2.0
+mcp-types>=2.2.0
+ddgs>=9.16.0
+duckduckgo-search>=8.1.1
+fastapi>=0.141.0
+uvicorn>=0.52.0
+pydantic>=2.13.0
+streamlit>=1.64.0
+sse-starlette>=3.4.11
+httpx>=0.28.0
+pytest>=9.1.0
+pytest-asyncio>=1.4.0
+tenacity>=8.2.0
