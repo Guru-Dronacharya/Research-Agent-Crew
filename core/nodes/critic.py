@@ -1,3 +1,4 @@
+from core.events import emit_run_event, get_run_event_bus
 """Critic Agent Node for Research Agent Crew.
 
 Implements hybrid evaluation combining:
@@ -31,6 +32,9 @@ async def critic_node(state: AgentState) -> Dict[str, Any]:
     run_id = state.get("run_id")
     if await is_cancellation_requested(run_id):
         raise RunCancelledError(f"Run {run_id} cancelled by user")
+
+    is_resumed = bool(state.get("is_resume", False))
+    await emit_run_event(run_id=run_id, event_type="node_started", node="critic", data={"node": "critic", "resumed": is_resumed})
 
     task = state["task"]
     plan = state["plan"]
@@ -236,6 +240,36 @@ async def critic_node(state: AgentState) -> Dict[str, Any]:
             caps_fired=caps_fired
         )
     )
+    await emit_run_event(
+        run_id=run_id,
+        event_type="rubric_evaluation",
+        node="critic",
+        data={
+            "verdict": evaluation.verdict,
+            "total_score": evaluation.total_score,
+            "coverage": evaluation.coverage.score,
+            "evidence": evaluation.evidence.score,
+            "coherence": evaluation.coherence.score,
+            "overall_feedback": evaluation.overall_feedback,
+            "caps_fired": caps_fired,
+            "iteration": evaluation.iteration
+        }
+    )
+    await emit_run_event(
+        run_id=run_id,
+        event_type="critic_verdict",
+        node="critic",
+        data={
+            "verdict": evaluation.verdict,
+            "total_score": evaluation.total_score,
+            "coverage": evaluation.coverage.score,
+            "evidence": evaluation.evidence.score,
+            "coherence": evaluation.coherence.score,
+            "overall_feedback": evaluation.overall_feedback,
+            "caps_fired": caps_fired,
+            "iteration": evaluation.iteration
+        }
+    )
 
     if not is_pass:
         # Check revision reserve and retry counts
@@ -275,6 +309,27 @@ async def critic_node(state: AgentState) -> Dict[str, Any]:
                     iteration=retry_count
                 )
             )
+
+    if escalation_reason:
+        await emit_run_event(
+            run_id=run_id,
+            event_type="escalation",
+            node="critic",
+            data={
+                "reason": escalation_reason,
+                "retry_count": retry_count,
+                "iteration": retry_count
+            }
+        )
+
+    await emit_run_event(
+        run_id=run_id,
+        event_type="node_finished",
+        node="critic",
+        data={"node": "critic", "verdict": evaluation.verdict, "status": status}
+    )
+    if run_id:
+        await get_run_event_bus(run_id).flush()
 
     return {
         "critic_evaluations": critic_evals,

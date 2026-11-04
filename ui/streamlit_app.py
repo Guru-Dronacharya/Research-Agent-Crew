@@ -250,22 +250,103 @@ latest_run = runs[-1] if runs else None
 
 # Check current run status
 if latest_run and latest_run.status == "running":
-    st.info(f"⏳ **Run in Progress**: `{latest_run.task}`")
-    col_c1, col_c2 = st.columns([4, 1])
-    with col_c2:
-        if st.button("⏹️ Cancel Run", key=f"cancel_{latest_run.id}", type="secondary"):
+    # Cancel control header
+    ch_col1, ch_col2 = st.columns([4, 1])
+    with ch_col1:
+        st.info(f"⏳ **Run in Progress**: `{latest_run.task}`")
+    with ch_col2:
+        if st.button("⏹️ Cancel Run", key=f"cancel_{latest_run.id}", type="secondary", use_container_width=True):
             runner.run_sync(cancel_run(latest_run.id))
             st.warning("Cancellation requested...")
             time.sleep(1)
             st.rerun()
 
-    # Poll and display latest events
+    # Retrieve all persisted events ordered by seq
     events = runner.run_sync(event_repo.list_events_by_run(latest_run.id))
-    with st.status(f"Executing '{latest_run.task[:50]}...' ({len(events)} telemetry events)", expanded=True):
-        for ev in events[-8:]:
-            st.write(f"[{ev.ts[11:19]}] **{ev.node or 'system'}** ({ev.type}): {ev.payload.get('summary', '')}")
 
-    time.sleep(1.5)
+    # Parse live progress telemetry from events
+    active_node = "planner"
+    discovered_sources = []
+    sections_received = []
+    subtasks_info = {}
+    last_critic_info = None
+    live_searches = 0
+    live_cache_hits = 0
+
+    for ev in events:
+        etype = ev.type
+        payload = ev.data or ev.payload or {}
+        enode = ev.node or payload.get("node")
+        if etype == "node_started":
+            active_node = enode or active_node
+        elif etype == "decomposition":
+            for s in payload.get("subtasks", []):
+                s_id = s.get("id") if isinstance(s, dict) else getattr(s, "id", None)
+                s_title = s.get("title") if isinstance(s, dict) else getattr(s, "title", "")
+                if s_id:
+                    subtasks_info[s_id] = {"title": s_title, "sources": 0, "status": "pending"}
+        elif etype == "source_found":
+            discovered_sources.append(payload)
+            s_id = ev.subtask_id or payload.get("subtask_id")
+            if s_id and s_id in subtasks_info:
+                subtasks_info[s_id]["sources"] += 1
+                subtasks_info[s_id]["status"] = "evidence gathered"
+            if payload.get("cached"):
+                live_cache_hits += 1
+        elif etype == "tool_call":
+            if payload.get("tool_name") == "search_web":
+                live_searches += 1
+                s_id = ev.subtask_id or payload.get("subtask_id")
+                if s_id and s_id in subtasks_info:
+                    subtasks_info[s_id]["status"] = "searching"
+        elif etype == "report_section":
+            sections_received.append(payload)
+        elif etype in ("critic_verdict", "rubric_evaluation"):
+            last_critic_info = payload
+
+    # Live Metrics Banner
+    lm1, lm2, lm3, lm4 = st.columns(4)
+    lm1.metric("Active Node", f"🤖 {active_node.upper()}")
+    lm2.metric("Searches Executed", f"{live_searches} / {search_budget}")
+    lm3.metric("Cache Hits", live_cache_hits)
+    lm4.metric("Sources Found", len(discovered_sources))
+
+    # Live Progress Status Container
+    with st.status(f"⚡ Research Crew Live Stream: {active_node.capitalize()} Agent active ({len(events)} events)", expanded=True):
+        st.markdown(f"**Current Phase:** `{active_node}` | **Discovered Evidence Items:** `{len(discovered_sources)}`")
+
+        # Display subtasks progress if decomposed
+        if subtasks_info:
+            st.markdown("**Subtasks Execution Tracker:**")
+            st_cols = st.columns(min(len(subtasks_info), 4))
+            for idx, (sid, sinfo) in enumerate(subtasks_info.items()):
+                with st_cols[idx % len(st_cols)]:
+                    st.caption(f"**{sid}**: {sinfo['title'][:30]}")
+                    st.write(f"Status: `{sinfo['status']}` ({sinfo['sources']} sources)")
+
+        # Display synthesized sections as they arrive
+        if sections_received:
+            st.markdown("---")
+            st.markdown("**📝 Live Synthesizer Sections:**")
+            for sec in sections_received[-2:]:
+                st.write(f"📌 **{sec.get('heading', '')}**: {sec.get('summary', '')[:120]}...")
+
+        # Display critic verdict if ready
+        if last_critic_info:
+            st.markdown("---")
+            v_val = last_critic_info.get("verdict", "")
+            t_score = last_critic_info.get("total_score", 0)
+            st.write(f"⚖️ **Critic Evaluation:** `{v_val}` (Score: `{t_score}/15`)")
+
+        # Recent events log
+        st.markdown("---")
+        st.caption("Latest Telemetry Stream:")
+        for ev in events[-6:]:
+            p = ev.data or ev.payload or {}
+            summ = p.get("summary") or p.get("message") or p.get("action_taken") or str(p)[:80]
+            st.text(f"[{ev.ts[11:19]}] seq={ev.seq} | {ev.node or 'system'} | {ev.type} | {summ}")
+
+    time.sleep(0.8)
     st.rerun()
 
 elif latest_run and latest_run.status == "paused_quota":

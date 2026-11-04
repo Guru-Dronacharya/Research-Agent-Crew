@@ -16,9 +16,7 @@ from core.db.repositories import (
     ThreadRepo,
     MessageRepo,
     RunRepo,
-    EventRepo,
-    RunRecord,
-    utc_now_iso
+    RunRecord
 )
 from core.checkpoint import get_checkpointer
 from core.graph import build_research_graph, create_initial_state
@@ -29,6 +27,7 @@ from core.cancellation import (
     clear_cancellation_in_process,
     RunCancelledError
 )
+from core.events import get_run_event_bus, remove_run_event_bus
 
 
 async def start_run(
@@ -134,7 +133,6 @@ async def execute_run(
     """Execute or resume a run through the LangGraph checkpointed loop."""
     run_repo = RunRepo(db_path=db_path)
     msg_repo = MessageRepo(db_path=db_path)
-    event_repo = EventRepo(db_path=db_path)
 
     run = await run_repo.get_run(run_id)
     if not run:
@@ -146,6 +144,9 @@ async def execute_run(
     # Mark run as running and set owner
     await run_repo.update_run_status(run_id, status="running")
     await run_repo.update_heartbeat(run_id, owner_id=owner_id)
+
+    # Initialize per-run event bus
+    bus = get_run_event_bus(run_id, db_path=db_path)
 
     # Heartbeat background task
     heartbeat_stop = asyncio.Event()
@@ -164,6 +165,12 @@ async def execute_run(
     heartbeat_task = asyncio.create_task(_heartbeat_loop())
 
     try:
+        await bus.emit(
+            event_type="run_started",
+            node=None,
+            data={"task": run.task, "thread_id": run.thread_id, "is_resume": is_resume}
+        )
+
         async with get_checkpointer(checkpoint_db_path) as checkpointer:
             graph = build_research_graph(checkpointer=checkpointer)
             langgraph_thread_id = f"{run.thread_id}:{run.id}"
@@ -178,10 +185,11 @@ async def execute_run(
             if await is_cancellation_requested(run.id, db_path=db_path):
                 raise RunCancelledError(f"Run '{run.id}' was cancelled before starting.")
 
-            # Incremental event persistence: track how many events already saved
-            persisted_events = await event_repo.count_events_by_run(run.id)
-
             if is_resume:
+                try:
+                    await graph.aupdate_state(graph_config, {"is_resume": True})
+                except Exception:
+                    pass
                 input_state = None
             else:
                 cfg = run.config or {}
@@ -193,39 +201,15 @@ async def execute_run(
                     max_retries=max_retries,
                     max_search_budget=search_budget,
                     model_name=model_name,
-                    run_id=run.id
+                    run_id=run.id,
+                    is_resume=False
                 )
 
             # Stream execution chunk by chunk
-            async for chunk in graph.astream(input_state, config=graph_config, stream_mode="updates"):
+            async for _ in graph.astream(input_state, config=graph_config, stream_mode="updates"):
                 if await is_cancellation_requested(run.id, db_path=db_path):
                     raise RunCancelledError(f"Run '{run.id}' cancelled by user.")
-
-                # Retrieve cumulative state after this node update to persist only new events
-                curr_state_tuple = await graph.aget_state(graph_config)
-                if curr_state_tuple and curr_state_tuple.values:
-                    cumulative_events = curr_state_tuple.values.get("trace_events") or []
-                    if len(cumulative_events) > persisted_events:
-                        for ev in cumulative_events[persisted_events:]:
-                            ev_ts = ev.timestamp if hasattr(ev, "timestamp") else ev.get("timestamp", utc_now_iso())
-                            ev_type = ev.event_type if hasattr(ev, "event_type") else ev.get("event_type", "event")
-                            ev_step = ev.step if hasattr(ev, "step") else ev.get("step")
-                            ev_summary = ev.summary if hasattr(ev, "summary") else ev.get("summary", "")
-                            ev_details = ev.details if hasattr(ev, "details") else ev.get("details", {})
-                            ev_iteration = ev.iteration if hasattr(ev, "iteration") else ev.get("iteration", 0)
-
-                            await event_repo.append_event(
-                                run_id=run.id,
-                                ts=ev_ts,
-                                event_type=ev_type,
-                                node=ev_step,
-                                payload={
-                                    "summary": ev_summary,
-                                    "details": ev_details,
-                                    "iteration": ev_iteration
-                                }
-                            )
-                        persisted_events = len(cumulative_events)
+                await bus.flush()
 
             # Execution completed cleanly; fetch final checkpoint state
             final_state_tuple = await graph.aget_state(graph_config)
@@ -246,6 +230,14 @@ async def execute_run(
                 "mcp_saved_path": final_state.get("mcp_saved_path")
             }
 
+            # Emit run_finished event via bus and flush to DB BEFORE updating run status in DB
+            await bus.emit(
+                event_type="run_finished",
+                node="finalizer",
+                data={"status": final_status, "metrics": metrics}
+            )
+            await bus.flush()
+
             await run_repo.save_run_result(
                 run_id=run.id,
                 status=final_status,
@@ -264,59 +256,56 @@ async def execute_run(
                     metadata={"status": final_status, "metrics": metrics}
                 )
 
-            # Log completion event
-            await event_repo.append_event(
-                run_id=run.id,
-                ts=utc_now_iso(),
-                event_type="completed",
-                node="finalizer",
-                payload={"status": final_status, "metrics": metrics}
-            )
-
     except QuotaExceededError as q_err:
         reset_time_iso = q_err.resume_after_iso or get_daily_quota_tracker().get_reset_time_iso()
+        await bus.emit(
+            event_type="quota_paused",
+            node=None,
+            data={"error": str(q_err), "resume_after": reset_time_iso}
+        )
+        await bus.flush()
         await run_repo.update_run_status(
             run_id=run.id,
             status="paused_quota",
             error=str(q_err),
             resume_after=reset_time_iso
         )
-        await event_repo.append_event(
-            run_id=run.id,
-            ts=utc_now_iso(),
-            event_type="paused_quota",
-            payload={"error": str(q_err), "resume_after": reset_time_iso}
-        )
     except RunCancelledError as c_err:
+        await bus.emit(
+            event_type="error",
+            node=None,
+            data={"error": str(c_err), "cancelled": True}
+        )
+        await bus.flush()
         await run_repo.update_run_status(
             run_id=run.id,
             status="cancelled",
             error=str(c_err),
             finished=True
         )
-        await event_repo.append_event(
-            run_id=run.id,
-            ts=utc_now_iso(),
-            event_type="cancelled",
-            payload={"error": str(c_err)}
-        )
     except Exception as exc:
+        await bus.emit(
+            event_type="error",
+            node=None,
+            data={"error": str(exc)}
+        )
+        await bus.flush()
         await run_repo.update_run_status(
             run_id=run.id,
             status="failed",
             error=str(exc),
             finished=True
         )
-        await event_repo.append_event(
-            run_id=run.id,
-            ts=utc_now_iso(),
-            event_type="failed",
-            payload={"error": str(exc)}
-        )
     finally:
         heartbeat_stop.set()
         heartbeat_task.cancel()
         clear_cancellation_in_process(run_id)
+        try:
+            await bus.flush()
+            await bus.close()
+        except Exception:
+            pass
+        remove_run_event_bus(run_id)
 
     updated_run = await run_repo.get_run(run_id)
     return updated_run or run

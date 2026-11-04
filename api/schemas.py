@@ -131,7 +131,15 @@ class RunEventResponse(BaseModel):
     ts: str
     type: str
     node: Optional[str] = None
+    subtask_id: Optional[str] = None
+    data: Dict[str, Any] = Field(default_factory=dict)
     payload: Dict[str, Any] = Field(default_factory=dict)
+
+
+class SignedTokenResponse(BaseModel):
+    """Short-lived signed authentication token for browser EventSource connections."""
+    token: str
+    expires_at: str
 
 
 class ThreadExportResponse(BaseModel):

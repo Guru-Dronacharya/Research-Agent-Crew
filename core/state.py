@@ -188,3 +188,4 @@ class AgentState(TypedDict):
     model_name: str
     timings: Optional[Dict[str, Any]]
     run_id: Optional[str]
+    is_resume: Optional[bool]

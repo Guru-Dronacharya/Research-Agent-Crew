@@ -1,3 +1,4 @@
+from core.events import emit_run_event, get_run_event_bus
 """Synthesizer Agent Node for Research Agent Crew.
 
 Compiles subtask findings and verified evidence into a cohesive, structured
@@ -26,6 +27,9 @@ async def synthesizer_node(state: AgentState) -> Dict[str, Any]:
     run_id = state.get("run_id")
     if await is_cancellation_requested(run_id):
         raise RunCancelledError(f"Run {run_id} cancelled by user")
+
+    is_resumed = bool(state.get("is_resume", False))
+    await emit_run_event(run_id=run_id, event_type="node_started", node="synthesizer", data={"node": "synthesizer", "resumed": is_resumed})
 
     task = state["task"]
     plan = state["plan"]
@@ -90,6 +94,34 @@ async def synthesizer_node(state: AgentState) -> Dict[str, Any]:
             iteration=iteration
         )
     )
+
+    if draft_report_structured and getattr(draft_report_structured, "sections", None):
+        for sec in draft_report_structured.sections:
+            await emit_run_event(
+                run_id=run_id,
+                event_type="report_section",
+                node="synthesizer",
+                subtask_id=sec.subtask_id,
+                data={
+                    "heading": sec.heading,
+                    "summary": sec.summary,
+                    "claims_count": len(sec.claims),
+                    "claims": [c.model_dump() if hasattr(c, "model_dump") else dict(c) for c in sec.claims]
+                }
+            )
+
+    await emit_run_event(
+        run_id=run_id,
+        event_type="node_finished",
+        node="synthesizer",
+        data={
+            "node": "synthesizer",
+            "word_count": len(draft_report.split()),
+            "sections_count": len(draft_report_structured.sections) if draft_report_structured else 0
+        }
+    )
+    if run_id:
+        await get_run_event_bus(run_id).flush()
 
     return {
         "draft_report": draft_report,

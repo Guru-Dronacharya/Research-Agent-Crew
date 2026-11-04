@@ -1,3 +1,4 @@
+from core.events import emit_run_event, get_run_event_bus
 """Finalizer Node for Research Agent Crew.
 
 Appends the Critic audit scorecard, packages machine-readable JSON summaries,
@@ -31,6 +32,9 @@ async def finalizer_node(state: AgentState) -> Dict[str, Any]:
     run_id = state.get("run_id")
     if await is_cancellation_requested(run_id):
         raise RunCancelledError(f"Run {run_id} cancelled by user")
+
+    is_resumed = bool(state.get("is_resume", False))
+    await emit_run_event(run_id=run_id, event_type="node_started", node="finalizer", data={"node": "finalizer", "resumed": is_resumed})
 
     task = state["task"]
     draft = state.get("draft_report") or ""
@@ -188,6 +192,15 @@ async def finalizer_node(state: AgentState) -> Dict[str, Any]:
             iteration=retry_count
         )
     )
+
+    await emit_run_event(
+        run_id=run_id,
+        event_type="node_finished",
+        node="finalizer",
+        data={"node": "finalizer", "status": "finished", "saved_path": saved_path}
+    )
+    if run_id:
+        await get_run_event_bus(run_id).flush()
 
     return {
         "final_report": final_report_content,

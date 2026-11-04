@@ -1,3 +1,4 @@
+from core.events import emit_run_event, get_run_event_bus
 """Executor Agent Node for Research Agent Crew.
 
 Executes subtasks concurrently by invoking Model Context Protocol (MCP) search tools,
@@ -62,6 +63,17 @@ async def _execute_single_subtask(
                 iteration=iteration
             )
             subtask_trace_events.append(budget_event)
+            await emit_run_event(
+                run_id=run_id,
+                event_type="budget_alert",
+                node="executor",
+                subtask_id=subtask.id,
+                data={
+                    "remaining": max(0, max_budget - total_searches_snapshot),
+                    "limit": max_budget,
+                    "action_taken": f"Search allocation exhausted for subtask '{subtask.id}'"
+                }
+            )
             return SubtaskExecutionOutput(
                 subtask_id=subtask.id,
                 title=subtask.title,
@@ -130,6 +142,13 @@ async def _execute_single_subtask(
                             )
                         )
                         findings_snippets.append(f"{title}: {snippet}")
+                        await emit_run_event(
+                            run_id=run_id,
+                            event_type="source_found",
+                            node="executor",
+                            subtask_id=subtask.id,
+                            data={"title": title, "url": url, "snippet": snippet, "cached": True}
+                        )
             else:
                 queries_to_search.append(query)
 
@@ -145,6 +164,17 @@ async def _execute_single_subtask(
                 iteration=iteration
             )
             subtask_trace_events.append(budget_event)
+            await emit_run_event(
+                run_id=run_id,
+                event_type="budget_alert",
+                node="executor",
+                subtask_id=subtask.id,
+                data={
+                    "remaining": allowed_searches,
+                    "limit": max_budget,
+                    "action_taken": f"Search allocation exhausted for subtask '{subtask.id}'"
+                }
+            )
 
         for query in queries_to_execute:
             subtask_trace_events.append(
@@ -161,10 +191,40 @@ async def _execute_single_subtask(
 
         # 3. Concurrently execute initial queries for this subtask
         async def _run_search(q: str):
+            await emit_run_event(
+                run_id=run_id,
+                event_type="tool_call",
+                node="executor",
+                subtask_id=subtask.id,
+                data={"tool_name": "search_web", "query": q, "max_results": 3}
+            )
             res = await mcp_client.call_tool(
                 "search_web",
                 arguments={"query": q, "max_results": 3},
                 timeout_sec=timeout_sec
+            )
+            dur = res.get("duration_ms", 0.0)
+            st = res.get("status", "error")
+            out = res.get("output", {})
+            cnt = len(out.get("results", [])) if isinstance(out, dict) else 0
+            err_msg = ""
+            if isinstance(out, dict):
+                err_msg = out.get("message") or out.get("error") or ""
+            elif isinstance(out, str):
+                err_msg = out
+            await emit_run_event(
+                run_id=run_id,
+                event_type="tool_result",
+                node="executor",
+                subtask_id=subtask.id,
+                data={
+                    "tool_name": "search_web",
+                    "query": q,
+                    "status": st,
+                    "duration_ms": dur,
+                    "results_count": cnt,
+                    "message": err_msg
+                }
             )
             return q, res
 
@@ -274,6 +334,13 @@ async def _execute_single_subtask(
                         )
                     )
                     findings_snippets.append(f"{title}: {snippet}")
+                    await emit_run_event(
+                        run_id=run_id,
+                        event_type="source_found",
+                        node="executor",
+                        subtask_id=subtask.id,
+                        data={"title": title, "url": url, "snippet": snippet, "cached": False}
+                    )
 
         # 5. Handle rephrase on zero results within remaining subtask budget share
         remaining_share = subtask_budget - searches_spent
@@ -289,6 +356,13 @@ async def _execute_single_subtask(
                     iteration=iteration
                 )
             )
+            await emit_run_event(
+                run_id=run_id,
+                event_type="tool_call",
+                node="executor",
+                subtask_id=subtask.id,
+                data={"tool_name": "rephrase_search_query", "query": empty_q, "reason": "zero_results"}
+            )
             rephrase_res = await mcp_client.call_tool(
                 "rephrase_search_query",
                 arguments={"query": empty_q, "reason": "zero_results"},
@@ -296,6 +370,13 @@ async def _execute_single_subtask(
             )
             rephrase_data = rephrase_res.get("output", {})
             suggested = rephrase_data.get("suggested_queries", []) if isinstance(rephrase_data, dict) else []
+            await emit_run_event(
+                run_id=run_id,
+                event_type="tool_result",
+                node="executor",
+                subtask_id=subtask.id,
+                data={"tool_name": "rephrase_search_query", "status": rephrase_res.get("status", "unknown"), "suggested_count": len(suggested)}
+            )
 
             if suggested:
                 fallback_query = suggested[0]
@@ -339,6 +420,20 @@ async def _execute_single_subtask(
                                 )
                             )
                             findings_snippets.append(f"{title}: {snippet}")
+                            await emit_run_event(
+                                run_id=run_id,
+                                event_type="source_found",
+                                node="executor",
+                                subtask_id=subtask.id,
+                                data={"title": title, "url": url, "snippet": snippet, "cached": False}
+                            )
+                            await emit_run_event(
+                                run_id=run_id,
+                                event_type="source_found",
+                                node="executor",
+                                subtask_id=subtask.id,
+                                data={"title": title, "url": url, "snippet": snippet, "cached": True}
+                            )
                 elif remaining_share > 0:
                     searches_spent += 1
                     remaining_share -= 1
@@ -351,6 +446,13 @@ async def _execute_single_subtask(
                             subtask_id=subtask.id,
                             iteration=iteration
                         )
+                    )
+                    await emit_run_event(
+                        run_id=run_id,
+                        event_type="tool_call",
+                        node="executor",
+                        subtask_id=subtask.id,
+                        data={"tool_name": "search_web", "query": fallback_query, "max_results": 3}
                     )
 
                     call_res = await mcp_client.call_tool(
@@ -389,6 +491,20 @@ async def _execute_single_subtask(
                             raw_result=output if isinstance(output, dict) else str(output)[:300],
                             iteration=iteration
                         )
+                    )
+                    await emit_run_event(
+                        run_id=run_id,
+                        event_type="tool_result",
+                        node="executor",
+                        subtask_id=subtask.id,
+                        data={
+                            "tool_name": "search_web",
+                            "query": fallback_query,
+                            "status": fb_status,
+                            "duration_ms": duration_ms,
+                            "results_count": len(results_list) if isinstance(results_list, list) else 0,
+                            "message": summary_str
+                        }
                     )
 
                     if isinstance(output, dict) and output.get("status") in ("success", "no_results"):
@@ -515,6 +631,14 @@ async def executor_node(state: AgentState) -> Dict[str, Any]:
     # Identify subtasks that have not yet been executed
     pending_subtasks = [s for s in plan.subtasks if not any(r.subtask_id == s.id for r in subtask_results)]
 
+    is_resumed = bool(state.get("is_resume", False))
+    await emit_run_event(
+        run_id=run_id,
+        event_type="node_started",
+        node="executor",
+        data={"node": "executor", "pending_subtasks": len(pending_subtasks), "resumed": is_resumed}
+    )
+
     if not pending_subtasks:
         return {
             "subtask_results": subtask_results,
@@ -584,6 +708,20 @@ async def executor_node(state: AgentState) -> Dict[str, Any]:
     else:
         initial_remaining = 0
         reserve_remaining = max(0, state.get("revision_reserve_remaining", 0) - iteration_searches_used)
+
+    await emit_run_event(
+        run_id=run_id,
+        event_type="node_finished",
+        node="executor",
+        data={
+            "node": "executor",
+            "subtasks_completed": len(subtask_outputs),
+            "searches_spent": iteration_searches_used,
+            "cache_hits": iteration_cache_hits
+        }
+    )
+    if run_id:
+        await get_run_event_bus(run_id).flush()
 
     return {
         "subtask_results": subtask_results,

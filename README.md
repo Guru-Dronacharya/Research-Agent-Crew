@@ -112,7 +112,58 @@ The system persists conversation history, runs, and telemetry events in SQLite (
 5. **REST API Version 2**:
    - Thread endpoints: `GET /threads`, `POST /threads`, `GET/PATCH/DELETE /threads/{id}`, `GET /threads/{id}/messages`, `GET /threads/{id}/export`.
    - Run endpoints: `POST /threads/{id}/runs`, `GET /runs/{id}`, `POST /runs/{id}/resume`, `POST /runs/{id}/cancel`.
+   - SSE telemetry endpoints: `GET /runs/{id}/events` (live SSE stream), `GET /runs/{id}/events/snapshot` (full persisted events JSON array), `POST /auth/sse-token` (short-lived signed tokens).
    - Legacy in-memory task endpoints (`POST /research/run`, `POST /research/start`, `GET /research/{task_id}/status`) remain functional for backward compatibility but are **deprecated**.
+
+6. **Live Progress Streaming (SSE)**:
+   - Real-time progress events are emitted by nodes and persisted via a dedicated writer task to SQLite (`run_events` by `seq`). SQLite is the single source of truth.
+   - Server-Sent Events (SSE) endpoint `GET /runs/{run_id}/events` replays events (`seq > after_seq`), then tails SQLite using fast in-process bus wakeup (or 0.5s polling fallback across processes) until terminal state.
+   - Standardized event model: `{seq, run_id, ts, type, node, subtask_id, data}`.
+   - Event types: `run_started`, `node_started` (with `resumed=true` on resume), `node_finished`, `tool_call`, `tool_result`, `source_found`, `budget_alert`, `quota_paused`, `critic_verdict`, `report_section`, `run_finished`, `error`, `heartbeat`, `stale`.
+   - Payload size capped at `EVENT_PAYLOAD_MAX_BYTES` (default 8192) with automatic redaction of sensitive credentials.
+   - Transient heartbeats (`type=heartbeat`) sent every ~15s to keep connections alive without cluttering SQLite.
+
+### Browser EventSource Authentication & Examples
+
+> [!NOTE]
+> Standard browser `EventSource` cannot send custom headers (`X-API-Key` or `Authorization`).
+
+#### Option 1: Signed Query Token (Recommended for `EventSource`)
+```javascript
+// 1. Obtain short-lived signed token using standard API key
+const tokenRes = await fetch('/auth/sse-token', {
+  method: 'POST',
+  headers: { 'X-API-Key': 'YOUR_API_KEY' }
+});
+const { token } = await tokenRes.json();
+
+// 2. Open standard EventSource with ?token=
+const eventSource = new EventSource(`/runs/${runId}/events?token=${encodeURIComponent(token)}`);
+eventSource.onmessage = (event) => {
+  const data = JSON.parse(event.data);
+  console.log(`[seq=${event.lastEventId}]`, data);
+};
+```
+
+#### Option 2: `fetch()` with `ReadableStream`
+```javascript
+const response = await fetch(`/runs/${runId}/events`, {
+  headers: { 'X-API-Key': 'YOUR_API_KEY' }
+});
+const reader = response.body.getReader();
+const decoder = new TextDecoder();
+while (true) {
+  const { value, done } = await reader.read();
+  if (done) break;
+  console.log(decoder.decode(value));
+}
+```
+
+#### Option 3: PowerShell / Curl
+```powershell
+# PowerShell SSE stream
+curl.exe -N -H "X-API-Key: YOUR_API_KEY" http://localhost:8000/runs/<RUN_ID>/events
+```
 
 ---
 

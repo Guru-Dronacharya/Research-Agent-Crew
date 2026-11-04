@@ -36,7 +36,8 @@ def create_initial_state(
     max_retries: int = 2,
     max_search_budget: int = 10,
     model_name: Optional[str] = None,
-    run_id: Optional[str] = None
+    run_id: Optional[str] = None,
+    is_resume: bool = False
 ) -> AgentState:
     """Helper to initialize a clean AgentState with split budget allocation."""
     resolved_model = model_name or ""
@@ -85,6 +86,7 @@ def create_initial_state(
         "mcp_saved_path": None,
         "model_name": resolved_model,
         "run_id": run_id,
+        "is_resume": is_resume,
         "timings": {
             "nodes": {},
             "llm_calls": [],

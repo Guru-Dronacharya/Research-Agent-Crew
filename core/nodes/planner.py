@@ -1,3 +1,4 @@
+from core.events import emit_run_event, get_run_event_bus
 """Planner Agent Node for Research Agent Crew.
 
 Decomposes the master research task into targeted subtasks, sets initial hypotheses,
@@ -25,6 +26,9 @@ async def planner_node(state: AgentState) -> Dict[str, Any]:
     run_id = state.get("run_id")
     if await is_cancellation_requested(run_id):
         raise RunCancelledError(f"Run {run_id} cancelled by user")
+
+    is_resumed = bool(state.get("is_resume", False))
+    await emit_run_event(run_id=run_id, event_type="node_started", node="planner", data={"node": "planner", "resumed": is_resumed})
 
     task = state["task"]
     iteration = state.get("retry_count", 0)
@@ -79,6 +83,32 @@ async def planner_node(state: AgentState) -> Dict[str, Any]:
             iteration=iteration
         )
     trace_events.append(event)
+
+    await emit_run_event(
+        run_id=run_id,
+        event_type="decomposition",
+        node="planner",
+        data={
+            "task": task,
+            "subtasks": [s.model_dump() for s in new_plan.subtasks],
+            "hypotheses": getattr(new_plan, "key_hypotheses", []) or getattr(new_plan, "hypotheses", []),
+            "iteration": iteration
+        }
+    )
+
+    await emit_run_event(
+        run_id=run_id,
+        event_type="node_finished",
+        node="planner",
+        data={
+            "node": "planner",
+            "subtasks_count": len(new_plan.subtasks),
+            "estimated_searches": new_plan.estimated_searches,
+            "iteration": iteration
+        }
+    )
+    if run_id:
+        await get_run_event_bus(run_id).flush()
 
     return {
         "plan": new_plan,

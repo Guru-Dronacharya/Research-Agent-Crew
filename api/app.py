@@ -7,6 +7,8 @@ and resume/cancel execution runs with SQLite checkpointing.
 
 import os
 import hmac
+import hashlib
+from datetime import datetime, timezone
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -15,7 +17,10 @@ from fastapi import FastAPI, HTTPException, Security, Request, BackgroundTasks
 from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 
+from sse_starlette.sse import EventSourceResponse
+from core.events import tail_run_events
 from api.schemas import (
+    SignedTokenResponse,
     ResearchRequest, ResearchResponse, CriticSummarySchema,
     SubtaskSummarySchema, TraceEventSummarySchema,
     ThreadCreateRequest, ThreadUpdateRequest, ThreadResponse,
@@ -41,6 +46,33 @@ from core.services.runs import (
     execute_run
 )
 
+
+def generate_signed_sse_token(expires_in_sec: int = 300) -> tuple[str, str]:
+    """Generate an HMAC-signed short-lived token for browser EventSource connections."""
+    secret = os.environ.get("API_KEY", "").strip() or "research-agent-crew-default-secret"
+    exp = int(time.time()) + expires_in_sec
+    exp_iso = datetime.fromtimestamp(exp, timezone.utc).isoformat()
+    msg = f"sse:{exp}".encode("utf-8")
+    sig = hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    return f"{exp}:{sig}", exp_iso
+
+
+def verify_signed_sse_token(token_str: str) -> bool:
+    """Validate an HMAC-signed short-lived token."""
+    secret = os.environ.get("API_KEY", "").strip() or "research-agent-crew-default-secret"
+    try:
+        parts = token_str.split(":", 1)
+        if len(parts) != 2:
+            return False
+        exp_str, sig = parts
+        exp = int(exp_str)
+        if time.time() > exp:
+            return False
+        expected_sig = hmac.new(secret.encode("utf-8"), f"sse:{exp}".encode("utf-8"), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(sig.encode("utf-8"), expected_sig.encode("utf-8"))
+    except Exception:
+        return False
+
 # API Key security header
 api_key_header_scheme = APIKeyHeader(name="X-API-Key", auto_error=False)
 
@@ -58,7 +90,17 @@ def verify_api_key(
     if not expected_key:
         return  # Authentication optional if API_KEY is unset
 
-    # Support X-API-Key header or Authorization: Bearer <key>
+    # 1. Query parameter token (HMAC signed)
+    token_param = request.query_params.get("token")
+    if token_param and verify_signed_sse_token(token_param):
+        return
+
+    # 2. Query parameter api_key
+    key_param = request.query_params.get("api_key")
+    if key_param and hmac.compare_digest(key_param.encode("utf-8"), expected_key.encode("utf-8")):
+        return
+
+    # 3. Header X-API-Key or Authorization: Bearer <key>
     provided_key = api_key_header
     if not provided_key:
         auth_header = request.headers.get("Authorization", "")
@@ -111,12 +153,25 @@ async def auth_middleware(request: Request, call_next):
     if request.method != "OPTIONS" and request.url.path != "/health":
         expected_key = os.environ.get("API_KEY", "").strip()
         if expected_key:
-            header_val = request.headers.get("X-API-Key")
-            if not header_val:
-                auth_val = request.headers.get("Authorization", "")
-                if auth_val.startswith("Bearer "):
-                    header_val = auth_val[7:].strip()
-            if not header_val or not hmac.compare_digest(header_val.encode("utf-8"), expected_key.encode("utf-8")):
+            is_authed = False
+            token_param = request.query_params.get("token")
+            if token_param and verify_signed_sse_token(token_param):
+                is_authed = True
+
+            key_param = request.query_params.get("api_key")
+            if not is_authed and key_param and hmac.compare_digest(key_param.encode("utf-8"), expected_key.encode("utf-8")):
+                is_authed = True
+
+            if not is_authed:
+                header_val = request.headers.get("X-API-Key")
+                if not header_val:
+                    auth_val = request.headers.get("Authorization", "")
+                    if auth_val.startswith("Bearer "):
+                        header_val = auth_val[7:].strip()
+                if header_val and hmac.compare_digest(header_val.encode("utf-8"), expected_key.encode("utf-8")):
+                    is_authed = True
+
+            if not is_authed:
                 from fastapi.responses import JSONResponse
                 return JSONResponse(status_code=401, content={"detail": "Invalid or missing API Key"})
     return await call_next(request)
@@ -337,6 +392,8 @@ async def export_thread_endpoint(thread_id: str):
                 ts=e.ts,
                 type=e.type,
                 node=e.node,
+                subtask_id=e.subtask_id,
+                data=e.data,
                 payload=e.payload
             )
             for e in all_events
@@ -492,6 +549,79 @@ async def cancel_run_endpoint(run_id: str):
         raise HTTPException(status_code=404, detail="Run not found")
     await cancel_run(run_id)
     return {"status": "cancel_requested", "run_id": run_id}
+
+@app.post("/auth/sse-token", response_model=SignedTokenResponse)
+async def create_sse_token_endpoint(expires_in: int = 300):
+    """Generate a short-lived signed token for browser EventSource connections."""
+    token, exp_iso = generate_signed_sse_token(expires_in_sec=expires_in)
+    return SignedTokenResponse(token=token, expires_at=exp_iso)
+
+
+@app.get("/runs/{run_id}/events")
+async def stream_run_events_endpoint(
+    run_id: str,
+    request: Request,
+    after_seq: int = 0
+):
+    """Stream live run telemetry events via SSE.
+
+    Replays persisted events from SQLite (seq > after_seq), then tails until run reaches terminal state.
+    Supports Last-Event-ID header and query parameter after_seq.
+    """
+    run_repo = RunRepo()
+    run = await run_repo.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    last_id = request.headers.get("Last-Event-ID")
+    if last_id and last_id.isdigit():
+        after_seq = max(after_seq, int(last_id))
+
+    async def event_generator():
+        async for ev in tail_run_events(run_id=run_id, after_seq=after_seq):
+            if await request.is_disconnected():
+                break
+            yield {
+                "id": str(ev.seq),
+                "event": ev.type,
+                "data": ev.model_dump_json()
+            }
+
+    return EventSourceResponse(
+        event_generator(),
+        ping=15,
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive"
+        }
+    )
+
+
+@app.get("/runs/{run_id}/events/snapshot", response_model=List[RunEventResponse])
+async def get_run_events_snapshot_endpoint(run_id: str):
+    """Retrieve full snapshot of persisted telemetry events for a run."""
+    run_repo = RunRepo()
+    run = await run_repo.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    event_repo = EventRepo()
+    events = await event_repo.list_events_by_run(run_id)
+    return [
+        RunEventResponse(
+            seq=e.seq,
+            run_id=e.run_id,
+            ts=e.ts,
+            type=e.type,
+            node=e.node,
+            subtask_id=e.subtask_id,
+            data=e.data,
+            payload=e.payload
+        )
+        for e in events
+    ]
+
 
 
 # ==============================================================================

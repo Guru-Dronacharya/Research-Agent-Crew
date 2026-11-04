@@ -68,7 +68,12 @@ class RunEventRecord:
     ts: str
     type: str
     node: Optional[str] = None
+    subtask_id: Optional[str] = None
     payload: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def data(self) -> Dict[str, Any]:
+        return self.payload
 
 
 class ThreadRepo:
@@ -514,6 +519,7 @@ class EventRepo:
         ts: str,
         event_type: str,
         node: Optional[str] = None,
+        subtask_id: Optional[str] = None,
         payload: Optional[Dict[str, Any]] = None
     ) -> RunEventRecord:
         """Append a single telemetry event."""
@@ -523,10 +529,10 @@ class EventRepo:
         async with get_db(self.db_path) as db:
             async with db.execute(
                 """
-                INSERT INTO run_events (run_id, ts, type, node, payload_json)
-                VALUES (?, ?, ?, ?, ?);
+                INSERT INTO run_events (run_id, ts, type, node, subtask_id, payload_json)
+                VALUES (?, ?, ?, ?, ?, ?);
                 """,
-                (run_id, ts, event_type, node, payload_json)
+                (run_id, ts, event_type, node, subtask_id, payload_json)
             ) as cur:
                 seq = cur.lastrowid
             await db.commit()
@@ -537,6 +543,7 @@ class EventRepo:
             ts=ts,
             type=event_type,
             node=node,
+            subtask_id=subtask_id,
             payload=payload_dict
         )
 
@@ -555,6 +562,28 @@ class EventRepo:
                         ts=r["ts"],
                         type=r["type"],
                         node=r["node"],
+                        subtask_id=r["subtask_id"] if "subtask_id" in r.keys() else None,
+                        payload=json.loads(r["payload_json"] or "{}")
+                    )
+                    for r in rows
+                ]
+
+    async def list_events_after(self, run_id: str, after_seq: int = 0) -> List[RunEventRecord]:
+        """Fetch all events for a run with sequence number strictly greater than after_seq."""
+        async with get_db(self.db_path) as db:
+            async with db.execute(
+                "SELECT * FROM run_events WHERE run_id = ? AND seq > ? ORDER BY seq ASC;",
+                (run_id, after_seq)
+            ) as cur:
+                rows = await cur.fetchall()
+                return [
+                    RunEventRecord(
+                        seq=r["seq"],
+                        run_id=r["run_id"],
+                        ts=r["ts"],
+                        type=r["type"],
+                        node=r["node"],
+                        subtask_id=r["subtask_id"] if "subtask_id" in r.keys() else None,
                         payload=json.loads(r["payload_json"] or "{}")
                     )
                     for r in rows
