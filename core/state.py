@@ -187,3 +187,4 @@ class AgentState(TypedDict):
     mcp_saved_path: Optional[str]
     model_name: str
     timings: Optional[Dict[str, Any]]
+    run_id: Optional[str]

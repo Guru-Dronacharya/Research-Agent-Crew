@@ -15,6 +15,7 @@ from core.tracer import TraceLogger
 from mcp_tools.client import MCPClientManager
 from core.timing import timed_node, record_tool_call_timing, log_timing_event
 from core.cache import get_search_cache
+from core.cancellation import is_cancellation_requested, RunCancelledError
 
 
 class SubtaskExecutionOutput(BaseModel):
@@ -38,7 +39,8 @@ async def _execute_single_subtask(
     max_budget: int,
     total_searches_snapshot: int,
     timeout_sec: float,
-    state_timings: Optional[Dict[str, Any]]
+    state_timings: Optional[Dict[str, Any]],
+    run_id: Optional[str] = None
 ) -> SubtaskExecutionOutput:
     """Execute a single subtask within its dedicated budget share."""
     subtask_trace_events: List[TraceEvent] = []
@@ -46,6 +48,9 @@ async def _execute_single_subtask(
     tools_invoked: List[str] = []
     findings_snippets: List[str] = []
     searches_spent = 0
+
+    if await is_cancellation_requested(run_id):
+        raise RunCancelledError(f"Run {run_id} cancelled by user")
 
     try:
         # Check if subtask has zero budget allocated
@@ -427,6 +432,8 @@ async def _execute_single_subtask(
         )
 
     except Exception as exc:
+        if isinstance(exc, RunCancelledError):
+            raise
         subtask_trace_events.append(
             TraceLogger.log_tool_result(
                 tool_name="search_web",
@@ -461,6 +468,10 @@ async def executor_node(state: AgentState) -> Dict[str, Any]:
     """
     if state.get("human_escalation_needed"):
         return {"status": "escalated"}
+
+    run_id = state.get("run_id")
+    if await is_cancellation_requested(run_id):
+        raise RunCancelledError(f"Run {run_id} cancelled by user")
 
     plan = state.get("plan")
     if not plan or not plan.subtasks:
@@ -524,6 +535,8 @@ async def executor_node(state: AgentState) -> Dict[str, Any]:
 
     async def _bounded_subtask_exec(subtask: Subtask, share: int):
         async with semaphore:
+            if await is_cancellation_requested(run_id):
+                raise RunCancelledError(f"Run {run_id} cancelled by user")
             return await _execute_single_subtask(
                 subtask=subtask,
                 subtask_budget=share,
@@ -532,7 +545,8 @@ async def executor_node(state: AgentState) -> Dict[str, Any]:
                 max_budget=max_budget,
                 total_searches_snapshot=total_searches,
                 timeout_sec=timeout_sec,
-                state_timings=state_timings
+                state_timings=state_timings,
+                run_id=run_id
             )
 
     tasks = [

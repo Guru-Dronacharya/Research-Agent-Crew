@@ -10,6 +10,7 @@ from core.llm import get_planner_llm
 from core.tracer import TraceLogger
 from core.timing import timed_node
 from core.ratelimit import QuotaExceededError
+from core.cancellation import is_cancellation_requested, RunCancelledError
 
 
 @timed_node("planner")
@@ -20,6 +21,10 @@ async def planner_node(state: AgentState) -> Dict[str, Any]:
     """
     if state.get("human_escalation_needed"):
         return {"status": "escalated"}
+
+    run_id = state.get("run_id")
+    if await is_cancellation_requested(run_id):
+        raise RunCancelledError(f"Run {run_id} cancelled by user")
 
     task = state["task"]
     iteration = state.get("retry_count", 0)
@@ -38,6 +43,8 @@ async def planner_node(state: AgentState) -> Dict[str, Any]:
             subtask_results=subtask_results
         )
     except QuotaExceededError as exc:
+        if state.get("run_id"):
+            raise
         trace_events = list(state.get("trace_events", []))
         escalation_reason = f"Daily LLM quota exceeded: {str(exc)}"
         trace_events.append(

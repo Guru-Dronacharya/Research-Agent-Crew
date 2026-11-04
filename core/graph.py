@@ -6,7 +6,7 @@ Includes explicit budget allocation across initial and revision rounds.
 """
 
 import os
-from typing import Literal, Optional
+from typing import Literal, Optional, Any
 from langgraph.graph import StateGraph, START, END
 from core.state import AgentState
 from core.nodes.planner import planner_node
@@ -35,7 +35,8 @@ def create_initial_state(
     task: str,
     max_retries: int = 2,
     max_search_budget: int = 10,
-    model_name: Optional[str] = None
+    model_name: Optional[str] = None,
+    run_id: Optional[str] = None
 ) -> AgentState:
     """Helper to initialize a clean AgentState with split budget allocation."""
     resolved_model = model_name or ""
@@ -83,6 +84,7 @@ def create_initial_state(
         "status": "planning",
         "mcp_saved_path": None,
         "model_name": resolved_model,
+        "run_id": run_id,
         "timings": {
             "nodes": {},
             "llm_calls": [],
@@ -93,8 +95,8 @@ def create_initial_state(
     }
 
 
-def build_research_graph():
-    """Build and compile the LangGraph research workflow."""
+def build_research_graph(checkpointer: Optional[Any] = None):
+    """Build and compile the LangGraph research workflow with optional checkpointer."""
     workflow = StateGraph(AgentState)
 
     # Add agent nodes
@@ -123,7 +125,7 @@ def build_research_graph():
     # Terminate workflow
     workflow.add_edge("finalizer", END)
 
-    return workflow.compile()
+    return workflow.compile(checkpointer=checkpointer)
 
 
 # Singleton compiled graph instance

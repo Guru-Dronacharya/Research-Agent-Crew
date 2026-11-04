@@ -12,6 +12,7 @@ from core.state import AgentState
 from core.tracer import TraceLogger
 from mcp_tools.client import MCPClientManager
 from core.timing import timed_node
+from core.cancellation import is_cancellation_requested, RunCancelledError
 
 
 def _slugify(text: str) -> str:
@@ -27,6 +28,10 @@ async def finalizer_node(state: AgentState) -> Dict[str, Any]:
 
     Enriches draft report with audit scorecard and persists artifacts using MCP.
     """
+    run_id = state.get("run_id")
+    if await is_cancellation_requested(run_id):
+        raise RunCancelledError(f"Run {run_id} cancelled by user")
+
     task = state["task"]
     draft = state.get("draft_report") or ""
     critic_evals = state.get("critic_evaluations", [])

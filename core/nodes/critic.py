@@ -15,6 +15,7 @@ from core.tracer import TraceLogger
 from core.critic_checks import run_deterministic_critic_checks
 from core.timing import timed_node
 from core.ratelimit import QuotaExceededError
+from core.cancellation import is_cancellation_requested, RunCancelledError
 
 
 @timed_node("critic")
@@ -26,6 +27,10 @@ async def critic_node(state: AgentState) -> Dict[str, Any]:
     """
     if state.get("human_escalation_needed"):
         return {"status": "escalated"}
+
+    run_id = state.get("run_id")
+    if await is_cancellation_requested(run_id):
+        raise RunCancelledError(f"Run {run_id} cancelled by user")
 
     task = state["task"]
     plan = state["plan"]
@@ -144,6 +149,8 @@ async def critic_node(state: AgentState) -> Dict[str, Any]:
             )
             evaluation.judge_skipped = False
         except QuotaExceededError as exc:
+            if state.get("run_id"):
+                raise
             escalation_reason = f"Daily LLM quota exceeded: {str(exc)}"
             trace_events.append(
                 TraceLogger.log_escalation(
@@ -219,6 +226,18 @@ async def critic_node(state: AgentState) -> Dict[str, Any]:
 
         evaluation.next_step_instructions = combined_instructions[:3]
 
+    # 5. Log structured observability trace (rubric_evaluation MUST precede escalation)
+    critic_evals.append(evaluation)
+    trace_events.append(
+        TraceLogger.log_critic_evaluation(
+            evaluation=evaluation,
+            iteration=evaluation.iteration,
+            deterministic_metrics=deterministic_metrics,
+            caps_fired=caps_fired
+        )
+    )
+
+    if not is_pass:
         # Check revision reserve and retry counts
         if reserve_remaining <= 0:
             # Out of revision search budget
@@ -256,17 +275,6 @@ async def critic_node(state: AgentState) -> Dict[str, Any]:
                     iteration=retry_count
                 )
             )
-
-    # 5. Log structured observability trace
-    critic_evals.append(evaluation)
-    trace_events.append(
-        TraceLogger.log_critic_evaluation(
-            evaluation=evaluation,
-            iteration=evaluation.iteration,
-            deterministic_metrics=deterministic_metrics,
-            caps_fired=caps_fired
-        )
-    )
 
     return {
         "critic_evaluations": critic_evals,

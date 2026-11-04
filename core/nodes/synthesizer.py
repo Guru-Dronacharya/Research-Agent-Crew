@@ -11,6 +11,7 @@ from core.llm import get_synth_llm
 from core.tracer import TraceLogger
 from core.timing import timed_node
 from core.ratelimit import QuotaExceededError
+from core.cancellation import is_cancellation_requested, RunCancelledError
 
 
 @timed_node("synthesizer")
@@ -21,6 +22,10 @@ async def synthesizer_node(state: AgentState) -> Dict[str, Any]:
     """
     if state.get("human_escalation_needed"):
         return {"status": "escalated"}
+
+    run_id = state.get("run_id")
+    if await is_cancellation_requested(run_id):
+        raise RunCancelledError(f"Run {run_id} cancelled by user")
 
     task = state["task"]
     plan = state["plan"]
@@ -50,6 +55,8 @@ async def synthesizer_node(state: AgentState) -> Dict[str, Any]:
             draft_report = str(synth_output)
             draft_report_structured = None
     except QuotaExceededError as exc:
+        if state.get("run_id"):
+            raise
         trace_events = list(state.get("trace_events", []))
         escalation_reason = f"Daily LLM quota exceeded: {str(exc)}"
         trace_events.append(

@@ -79,6 +79,40 @@ cp .env.example .env
 - `SEARCH_BUDGET`: Hard limit on MCP web searches across iterations (default `10`).
 - `TAVILY_API_KEY`: Optional API key for Tavily search provider.
 - `BRAVE_API_KEY`: Optional API key for Brave search provider.
+- `DATABASE_PATH`: SQLite file path for persistent threads, messages, runs, and events (default `data/app.db`).
+- `CHECKPOINT_DB_PATH`: SQLite checkpointer path for LangGraph node state checkpoints (default `data/checkpoints.db`).
+- `HEARTBEAT_STALE_SECONDS`: Heartbeat staleness threshold in seconds for orphaned run recovery (default `60`).
+- `CORS_ORIGINS`: Comma-separated allowed origins for REST API (default `http://localhost:3000,http://localhost:8501`).
+- `API_KEY`: Optional shared secret header (`X-API-Key` or `Authorization: Bearer <key>`) enforced using constant-time comparison on all routes except `/health`.
+
+---
+
+## Threads, Resuming, and Quotas
+
+The system persists conversation history, runs, and telemetry events in SQLite (`data/app.db`) in WAL mode with foreign keys enabled, and persists LangGraph node states using the official async SQLite checkpointer (`data/checkpoints.db`).
+
+1. **Persistent Conversation Threads**:
+   - Create, list, rename, archive, and delete threads.
+   - Auto-titling derives clean thread titles deterministically from the first 50 characters of user prompts without calling an LLM.
+   - Deleting a thread cascades across runs, messages, and run events, and purges all associated state checkpoints.
+
+2. **Resumable Runs & SQLite Checkpointing**:
+   - Each run is associated with a thread and tracked in a `runs` table with lifecycle states: `pending` $\to$ `running` $\to$ `completed` / `escalated` / `failed` / `paused_quota` / `cancelled`.
+   - Node-level state is checkpointed under `{thread_id}:{run_id}`.
+   - Resuming via `resume_run(run_id)` continues execution from the exact last successful node. Completed subtasks are never re-run, and search/LLM budgets are never double-counted.
+   - At application startup, running runs without a fresh heartbeat within 60s are automatically marked `failed` with reason `interrupted` and can be resumed.
+
+3. **Daily Quota Pausing & Scheduling**:
+   - When Google Gemini daily quota is exhausted (429 with long retry delay or local `LLM_RPD` threshold), the run transitions to `paused_quota` with `resume_after` set to the midnight Pacific Time reset boundary.
+   - Resuming before `resume_after` is refused unless explicitly forced with `force=True`.
+
+4. **Cooperative Cancellation**:
+   - `cancel_run(run_id)` flags the run in memory and sets `cancel_requested = 1` in SQLite. Nodes and executor query loops poll this flag and halt execution cleanly.
+
+5. **REST API Version 2**:
+   - Thread endpoints: `GET /threads`, `POST /threads`, `GET/PATCH/DELETE /threads/{id}`, `GET /threads/{id}/messages`, `GET /threads/{id}/export`.
+   - Run endpoints: `POST /threads/{id}/runs`, `GET /runs/{id}`, `POST /runs/{id}/resume`, `POST /runs/{id}/cancel`.
+   - Legacy in-memory task endpoints (`POST /research/run`, `POST /research/start`, `GET /research/{task_id}/status`) remain functional for backward compatibility but are **deprecated**.
 
 ---
 
@@ -149,3 +183,12 @@ python -m streamlit run ui/streamlit_app.py
 ```bash
 python -m pytest
 ```
+
+### Run Resilience & Completion Demo
+
+```bash
+python docs/demo_resumable_run.py
+```
+
+> **Note**: `docs/demo_resumable_run.py` executes 100% offline using deterministic test doubles (`StubLLM`, `PassingCriticLLM`, and mock MCP search tool). It does not require a live Gemini API key or consume external quota.
+

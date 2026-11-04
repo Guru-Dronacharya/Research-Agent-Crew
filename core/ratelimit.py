@@ -15,7 +15,7 @@ import threading
 from pathlib import Path
 from typing import Optional
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
@@ -23,9 +23,15 @@ PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
 
 class QuotaExceededError(RuntimeError):
     """Raised when daily request quota (LLM_RPD) is exceeded."""
-    def __init__(self, message: str, reset_time: Optional[str] = None):
+    def __init__(
+        self,
+        message: str,
+        reset_time: Optional[str] = None,
+        resume_after_iso: Optional[str] = None
+    ):
         super().__init__(message)
         self.reset_time = reset_time
+        self.resume_after_iso = resume_after_iso
 
 
 class DailyModelQuotaTracker:
@@ -73,6 +79,12 @@ class DailyModelQuotaTracker:
         reset_local_str = tomorrow_pt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
         return f"Quota resets at {reset_pt_str} ({reset_local_str} local)"
 
+    def get_reset_time_iso(self) -> str:
+        """Return ISO-8601 UTC timestamp of the next midnight PT quota reset."""
+        now_pt = self.get_pacific_now()
+        tomorrow_pt = (now_pt + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return tomorrow_pt.astimezone(timezone.utc).isoformat()
+
     def check_and_increment(self, model: str, rpd_limit: Optional[int] = None) -> int:
         """Atomically check quota and increment request counter.
 
@@ -98,9 +110,11 @@ class DailyModelQuotaTracker:
 
                 if rpd_limit is not None and rpd_limit > 0 and current_count >= rpd_limit:
                     cursor.execute("ROLLBACK;")
+                    reset_iso = self.get_reset_time_iso()
                     raise QuotaExceededError(
                         f"Daily quota exceeded for model '{clean_model}': {current_count}/{rpd_limit} requests used on {date_pt} PT. {reset_msg}.",
-                        reset_time=reset_msg
+                        reset_time=reset_msg,
+                        resume_after_iso=reset_iso
                     )
 
                 cursor.execute("""
