@@ -3,6 +3,7 @@
 __pycache__/
 *.pyc
 data/
+data/models/
 .cache/
 reports/*
 !reports/.gitkeep

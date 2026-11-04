@@ -242,23 +242,37 @@ def compute_budget_respected(total_searches: int, max_budget: int) -> bool:
     return total_searches <= max_budget
 
 
-def compute_structured_claim_metrics(structured: Optional[StructuredReport]) -> Dict[str, Any]:
+def compute_structured_claim_metrics(
+    structured: Optional[StructuredReport],
+    subtask_results: Optional[List[SubtaskResult]] = None
+) -> Dict[str, Any]:
     """Compute deterministic metrics across structured claims:
     - total claim count
     - claims per subtask (dict)
     - low-confidence ratio (claims with confidence < 0.70)
+    - unsupported_claim_rate (claims backed only by search snippets or lacking full text evidence)
     """
     if not structured or not structured.sections:
         return {
             "claim_count": 0,
             "claims_per_subtask": {},
             "low_confidence_claims_count": 0,
-            "low_confidence_ratio": 0.0
+            "low_confidence_ratio": 0.0,
+            "unsupported_claims_count": 0,
+            "unsupported_claim_rate": 0.0
         }
+
+    # Build chunk lookup map from subtask results
+    chunk_map: Dict[str, Any] = {}
+    if subtask_results:
+        for r in subtask_results:
+            for c in getattr(r, "retrieved_chunks", []):
+                chunk_map[c.id] = c
 
     total_claims = 0
     claims_per_subtask: Dict[str, int] = {}
     low_confidence_count = 0
+    unsupported_claims_count = 0
 
     for sec in structured.sections:
         c_count = len(sec.claims)
@@ -268,13 +282,37 @@ def compute_structured_claim_metrics(structured: Optional[StructuredReport]) -> 
             if c.confidence < 0.70:
                 low_confidence_count += 1
 
+            # Check chunk-level backing: snippet-only chunks do not count for full support credit
+            is_supported = False
+            if c.chunk_ids:
+                backing_chunks = [chunk_map[cid] for cid in c.chunk_ids if cid in chunk_map]
+                if backing_chunks:
+                    # Supported if at least one backing chunk is not snippet_only
+                    is_supported = any(not (getattr(chk, "meta", {}).get("snippet_only", False)) for chk in backing_chunks)
+            elif chunk_map and c.source_urls:
+                # Fallback URL match in chunk map
+                valid_urls = {normalize_url(u) for u in c.source_urls}
+                for chk in chunk_map.values():
+                    if normalize_url(chk.source_url) in valid_urls and not (getattr(chk, "meta", {}).get("snippet_only", False)):
+                        is_supported = True
+                        break
+            else:
+                # If no chunks were ingested in this run (e.g. legacy/offline without RAG), default to supported
+                is_supported = True
+
+            if not is_supported:
+                unsupported_claims_count += 1
+
     low_conf_ratio = (low_confidence_count / total_claims) if total_claims > 0 else 0.0
+    unsupported_rate = (unsupported_claims_count / total_claims) if total_claims > 0 else 0.0
 
     return {
         "claim_count": total_claims,
         "claims_per_subtask": claims_per_subtask,
         "low_confidence_claims_count": low_confidence_count,
-        "low_confidence_ratio": round(low_conf_ratio, 3)
+        "low_confidence_ratio": round(low_conf_ratio, 3),
+        "unsupported_claims_count": unsupported_claims_count,
+        "unsupported_claim_rate": round(unsupported_rate, 3)
     }
 
 
@@ -313,7 +351,8 @@ def run_deterministic_critic_checks(state: AgentState) -> Dict[str, Any]:
     budget_respected = compute_budget_respected(total_searches, max_budget)
 
     # 7. Structured Claims Metrics
-    claim_metrics = compute_structured_claim_metrics(structured_report)
+    claim_metrics = compute_structured_claim_metrics(structured_report, subtask_results)
+    unsupported_claim_rate = claim_metrics.get("unsupported_claim_rate", 0.0)
 
     # Generate deterministic revision instructions for failing checks
     instructions = []
@@ -332,6 +371,11 @@ def run_deterministic_critic_checks(state: AgentState) -> Dict[str, Any]:
     if source_relevance < 0.6:
         instructions.append(
             f"Improve source relevance: align search queries more closely with master task keywords ({', '.join(relevance_data['keywords_checked'][:4])})."
+        )
+
+    if structured_report and unsupported_claim_rate > 0.25:
+        instructions.append(
+            f"High ratio of unsupported claims ({unsupported_claim_rate:.0%}) relying on search snippets without full-text evidence; retrieve authoritative sources."
         )
 
     if structured_report and claim_metrics["low_confidence_ratio"] > 0.5:
@@ -353,6 +397,7 @@ def run_deterministic_critic_checks(state: AgentState) -> Dict[str, Any]:
         "claims_per_subtask": claim_metrics["claims_per_subtask"],
         "low_confidence_ratio": claim_metrics["low_confidence_ratio"],
         "low_confidence_claims_count": claim_metrics["low_confidence_claims_count"],
+        "unsupported_claim_rate": unsupported_claim_rate,
         "structured_claim_metrics": claim_metrics,
         "deterministic_instructions": instructions
     }

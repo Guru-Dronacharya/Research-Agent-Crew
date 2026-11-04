@@ -56,6 +56,7 @@ def test_explicit_runtime_override():
         assert resolve_model_name("PLANNER_MODEL", explicit_override="gemini-custom") == "gemini-custom"
 
 
+@pytest.mark.slow
 def test_get_llm_factories_instantiate_expected_model():
     """Factories instantiate GeminiAgentLLM with corresponding model names."""
     with pytest.MonkeyPatch.context() as mp:

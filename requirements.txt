@@ -21,3 +21,9 @@ tenacity>=8.2.0
 aiosqlite>=0.22.0
 langgraph-checkpoint-sqlite>=3.1.3
 sqlite-vec==0.1.9 # Transitive dependency of langgraph-checkpoint-sqlite; currently unused
+# Phase 4 RAG & Ingestion dependencies
+pypdf==6.21.4
+rank_bm25==0.2.2
+fastembed==0.9.1
+trafilatura==2.3.1
+# Note: fastembed transitively uses onnxruntime==1.31.1 (pre-built Windows x64 binary wheel, no C++ compiler required)

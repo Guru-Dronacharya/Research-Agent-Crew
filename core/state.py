@@ -14,6 +14,7 @@ class Claim(BaseModel):
     text: str = Field(description="The factual claim statement or insight")
     source_urls: List[str] = Field(min_length=1, description="List of source URLs supporting this claim (minimum 1)")
     confidence: float = Field(default=1.0, ge=0.0, le=1.0, description="Confidence score from 0.0 to 1.0")
+    chunk_ids: List[str] = Field(default_factory=list, description="IDs of backing evidence chunks")
 
     @field_validator("confidence", mode="before")
     @classmethod
@@ -102,6 +103,19 @@ class SourceItem(BaseModel):
     relevance: str = Field(default="relevant", description="Relevance assessment")
 
 
+class RetrievedChunk(BaseModel):
+    """A granular text chunk retrieved from vector / hybrid search for grounding."""
+    id: str = Field(description="Unique ID of the chunk")
+    document_id: str = Field(description="Parent document ID")
+    thread_id: str = Field(description="Thread ID")
+    text: str = Field(description="Extracted chunk text")
+    score: float = Field(default=0.0, description="Relevance or hybrid search score")
+    source_url: str = Field(default="", description="Source URL or document name")
+    title: str = Field(default="", description="Source title")
+    subtask_id: Optional[str] = Field(default=None, description="Subtask for which chunk was retrieved")
+    meta: Dict[str, Any] = Field(default_factory=dict, description="Metadata such as snippet_only, chunk_index")
+
+
 class SubtaskResult(BaseModel):
     """Execution output for a single research subtask."""
     subtask_id: str = Field(description="ID of the subtask executed")
@@ -118,6 +132,10 @@ class SubtaskResult(BaseModel):
     evidence_gap: bool = Field(
         default=False,
         description="True if no usable evidence could be retrieved for this subtask"
+    )
+    retrieved_chunks: List[RetrievedChunk] = Field(
+        default_factory=list,
+        description="Retrieved RAG chunks backing this subtask"
     )
 
 
@@ -188,4 +206,5 @@ class AgentState(TypedDict):
     model_name: str
     timings: Optional[Dict[str, Any]]
     run_id: Optional[str]
+    thread_id: Optional[str]
     is_resume: Optional[bool]

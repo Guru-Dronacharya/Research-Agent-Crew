@@ -12,10 +12,15 @@ from core.db.repositories import (
     MessageRepo,
     RunRepo,
     EventRepo,
+    DocumentRepo,
+    ChunkRepo,
     ThreadRecord,
     MessageRecord,
     RunRecord,
     RunEventRecord,
+    DocumentRecord,
+    ChunkRecord,
+    ChunkQuotaExceededError,
 )
 
 __all__ = [
@@ -26,8 +31,13 @@ __all__ = [
     "MessageRepo",
     "RunRepo",
     "EventRepo",
+    "DocumentRepo",
+    "ChunkRepo",
     "ThreadRecord",
     "MessageRecord",
     "RunRecord",
     "RunEventRecord",
+    "DocumentRecord",
+    "ChunkRecord",
+    "ChunkQuotaExceededError",
 ]

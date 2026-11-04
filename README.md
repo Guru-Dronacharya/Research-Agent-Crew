@@ -217,6 +217,14 @@ The pipeline is optimized for maximum speed and throughput while preserving all 
 pip install -r requirements.txt
 ```
 
+### Download RAG Embedding Model Explicitly
+
+Research runs strictly forbid implicit or unexpected network model downloads. Download the local ONNX embedding weights explicitly before starting runs:
+
+```bash
+python -m core.rag.download_model
+```
+
 ### Launch FastAPI Service
 
 ```bash

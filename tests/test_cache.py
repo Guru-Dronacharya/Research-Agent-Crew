@@ -67,6 +67,7 @@ def test_error_and_timeout_not_cached(temp_cache):
     assert temp_cache.get_sync("rate limit query") is None
 
 
+@pytest.mark.slow
 def test_ttl_expiry(temp_cache):
     """Expired items return None."""
     query = "expiring query"

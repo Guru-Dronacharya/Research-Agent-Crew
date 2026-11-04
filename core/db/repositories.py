@@ -8,7 +8,7 @@ import os
 import json
 import uuid
 from datetime import datetime, timezone, timedelta
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from dataclasses import dataclass, field
 
 from core.db.connection import get_db
@@ -598,3 +598,399 @@ class EventRepo:
             ) as cur:
                 row = await cur.fetchone()
                 return row[0] if row else 0
+
+
+MAX_CHUNKS_PER_THREAD = int(os.environ.get("MAX_CHUNKS_PER_THREAD", "5000"))
+
+
+class ChunkQuotaExceededError(Exception):
+    """Raised when inserting chunks would exceed the thread chunk limit."""
+    pass
+
+
+@dataclass
+class DocumentRecord:
+    id: str
+    thread_id: str
+    kind: str  # 'web' | 'upload'
+    title: str
+    url_or_name: str
+    content_hash: str
+    status: str = "indexed"  # 'pending' | 'fetching' | 'indexed' | 'failed'
+    created_at: str = field(default_factory=utc_now_iso)
+    run_id: Optional[str] = None
+    meta: Dict[str, Any] = field(default_factory=dict)
+    chunk_count: int = 0
+    is_duplicate: bool = False
+
+
+@dataclass
+class ChunkRecord:
+    id: str
+    document_id: str
+    thread_id: str
+    idx: int
+    text: str
+    token_count: int = 0
+    embedding: Optional[bytes] = None
+    embedding_model: Optional[str] = None
+    embedding_dim: Optional[int] = None
+    meta: Dict[str, Any] = field(default_factory=dict)
+
+
+class DocumentRepo:
+    """Repository managing RAG Document entities."""
+
+    def __init__(self, db_path: Optional[str] = None):
+        self.db_path = db_path
+
+    async def create_document(
+        self,
+        thread_id: str,
+        kind: str,
+        title: str,
+        url_or_name: str,
+        content_hash: str,
+        run_id: Optional[str] = None,
+        status: str = "indexed",
+        meta: Optional[Dict[str, Any]] = None,
+        doc_id: Optional[str] = None
+    ) -> Tuple[DocumentRecord, bool]:
+        """Insert or retrieve existing document on (thread_id, content_hash) conflict.
+
+        Returns (document_record, is_duplicate).
+        """
+        id_str = doc_id or str(uuid.uuid4())
+        created_at = utc_now_iso()
+        meta_dict = meta or {}
+        meta_json = json.dumps(meta_dict)
+
+        async with get_db(self.db_path) as db:
+            async with db.execute(
+                """
+                INSERT INTO documents (id, thread_id, run_id, kind, title, url_or_name, content_hash, status, created_at, meta_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(thread_id, content_hash) DO NOTHING;
+                """,
+                (id_str, thread_id, run_id, kind, title, url_or_name, content_hash, status, created_at, meta_json)
+            ) as cur:
+                inserted = cur.rowcount > 0
+
+            if inserted:
+                await db.commit()
+                return DocumentRecord(
+                    id=id_str,
+                    thread_id=thread_id,
+                    run_id=run_id,
+                    kind=kind,
+                    title=title,
+                    url_or_name=url_or_name,
+                    content_hash=content_hash,
+                    status=status,
+                    created_at=created_at,
+                    meta=meta_dict,
+                    chunk_count=0,
+                    is_duplicate=False
+                ), False
+
+            # Conflict: fetch existing
+            async with db.execute(
+                """
+                SELECT d.*, COUNT(c.id) AS chunk_count
+                FROM documents d
+                LEFT JOIN chunks c ON c.document_id = d.id
+                WHERE d.thread_id = ? AND d.content_hash = ?
+                GROUP BY d.id;
+                """,
+                (thread_id, content_hash)
+            ) as cur:
+                row = await cur.fetchone()
+                if not row:
+                    raise RuntimeError("Failed to resolve conflicting document record")
+                doc = DocumentRecord(
+                    id=row["id"],
+                    thread_id=row["thread_id"],
+                    run_id=row["run_id"],
+                    kind=row["kind"],
+                    title=row["title"],
+                    url_or_name=row["url_or_name"],
+                    content_hash=row["content_hash"],
+                    status=row["status"],
+                    created_at=row["created_at"],
+                    meta=json.loads(row["meta_json"] or "{}"),
+                    chunk_count=row["chunk_count"],
+                    is_duplicate=True
+                )
+                return doc, True
+
+    async def get_document(self, doc_id: str) -> Optional[DocumentRecord]:
+        async with get_db(self.db_path) as db:
+            async with db.execute(
+                """
+                SELECT d.*, COUNT(c.id) AS chunk_count
+                FROM documents d
+                LEFT JOIN chunks c ON c.document_id = d.id
+                WHERE d.id = ?
+                GROUP BY d.id;
+                """,
+                (doc_id,)
+            ) as cur:
+                row = await cur.fetchone()
+                if not row:
+                    return None
+                return DocumentRecord(
+                    id=row["id"],
+                    thread_id=row["thread_id"],
+                    run_id=row["run_id"],
+                    kind=row["kind"],
+                    title=row["title"],
+                    url_or_name=row["url_or_name"],
+                    content_hash=row["content_hash"],
+                    status=row["status"],
+                    created_at=row["created_at"],
+                    meta=json.loads(row["meta_json"] or "{}"),
+                    chunk_count=row["chunk_count"]
+                )
+
+    async def get_document_by_hash(self, thread_id: str, content_hash: str) -> Optional[DocumentRecord]:
+        async with get_db(self.db_path) as db:
+            async with db.execute(
+                """
+                SELECT d.*, COUNT(c.id) AS chunk_count
+                FROM documents d
+                LEFT JOIN chunks c ON c.document_id = d.id
+                WHERE d.thread_id = ? AND d.content_hash = ?
+                GROUP BY d.id;
+                """,
+                (thread_id, content_hash)
+            ) as cur:
+                row = await cur.fetchone()
+                if not row:
+                    return None
+                return DocumentRecord(
+                    id=row["id"],
+                    thread_id=row["thread_id"],
+                    run_id=row["run_id"],
+                    kind=row["kind"],
+                    title=row["title"],
+                    url_or_name=row["url_or_name"],
+                    content_hash=row["content_hash"],
+                    status=row["status"],
+                    created_at=row["created_at"],
+                    meta=json.loads(row["meta_json"] or "{}"),
+                    chunk_count=row["chunk_count"]
+                )
+
+    async def list_documents_by_thread(self, thread_id: str) -> List[DocumentRecord]:
+        async with get_db(self.db_path) as db:
+            async with db.execute(
+                """
+                SELECT d.*, COUNT(c.id) AS chunk_count
+                FROM documents d
+                LEFT JOIN chunks c ON c.document_id = d.id
+                WHERE d.thread_id = ?
+                GROUP BY d.id
+                ORDER BY d.created_at DESC;
+                """,
+                (thread_id,)
+            ) as cur:
+                rows = await cur.fetchall()
+                return [
+                    DocumentRecord(
+                        id=r["id"],
+                        thread_id=r["thread_id"],
+                        run_id=r["run_id"],
+                        kind=r["kind"],
+                        title=r["title"],
+                        url_or_name=r["url_or_name"],
+                        content_hash=r["content_hash"],
+                        status=r["status"],
+                        created_at=r["created_at"],
+                        meta=json.loads(r["meta_json"] or "{}"),
+                        chunk_count=r["chunk_count"]
+                    )
+                    for r in rows
+                ]
+
+    async def update_document_status(
+        self,
+        doc_id: str,
+        status: str,
+        meta: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        async with get_db(self.db_path) as db:
+            if meta is not None:
+                meta_json = json.dumps(meta)
+                await db.execute(
+                    "UPDATE documents SET status = ?, meta_json = ? WHERE id = ?;",
+                    (status, meta_json, doc_id)
+                )
+            else:
+                await db.execute(
+                    "UPDATE documents SET status = ? WHERE id = ?;",
+                    (status, doc_id)
+                )
+            await db.commit()
+            return True
+
+    async def delete_document(self, doc_id: str) -> bool:
+        async with get_db(self.db_path) as db:
+            async with db.execute("DELETE FROM documents WHERE id = ?;", (doc_id,)) as cur:
+                deleted = cur.rowcount > 0
+            await db.commit()
+            return deleted
+
+
+class ChunkRepo:
+    """Repository managing RAG Chunk entities and vector persistence."""
+
+    def __init__(self, db_path: Optional[str] = None):
+        self.db_path = db_path
+
+    async def count_chunks_by_thread(self, thread_id: str) -> int:
+        async with get_db(self.db_path) as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM chunks WHERE thread_id = ?;",
+                (thread_id,)
+            ) as cur:
+                row = await cur.fetchone()
+                return row[0] if row else 0
+
+    async def insert_chunks(self, thread_id: str, chunks: List[ChunkRecord]) -> int:
+        """Insert a batch of chunks for a thread, validating thread chunk ceiling."""
+        if not chunks:
+            return 0
+
+        max_allowed = int(os.environ.get("MAX_CHUNKS_PER_THREAD", "5000"))
+        async with get_db(self.db_path) as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM chunks WHERE thread_id = ?;",
+                (thread_id,)
+            ) as cur:
+                row = await cur.fetchone()
+                current_count = row[0] if row else 0
+
+            if current_count + len(chunks) > max_allowed:
+                raise ChunkQuotaExceededError(
+                    f"Thread {thread_id} chunk limit exceeded: {current_count} existing + {len(chunks)} new > limit of {max_allowed}"
+                )
+
+            rows = [
+                (
+                    c.id,
+                    c.document_id,
+                    c.thread_id,
+                    c.idx,
+                    c.text,
+                    c.token_count,
+                    c.embedding,
+                    c.embedding_model,
+                    c.embedding_dim,
+                    json.dumps(c.meta or {})
+                )
+                for c in chunks
+            ]
+
+            await db.executemany(
+                """
+                INSERT INTO chunks (id, document_id, thread_id, idx, text, token_count, embedding, embedding_model, embedding_dim, meta_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                rows
+            )
+            await db.commit()
+            return len(chunks)
+
+    async def list_chunks_by_thread(
+        self,
+        thread_id: str,
+        embedding_model: Optional[str] = None
+    ) -> List[ChunkRecord]:
+        """Fetch chunks for thread, optionally filtering strictly by embedding_model."""
+        async with get_db(self.db_path) as db:
+            if embedding_model:
+                query = "SELECT * FROM chunks WHERE thread_id = ? AND embedding_model = ? ORDER BY idx ASC;"
+                params = (thread_id, embedding_model)
+            else:
+                query = "SELECT * FROM chunks WHERE thread_id = ? ORDER BY idx ASC;"
+                params = (thread_id,)
+
+            async with db.execute(query, params) as cur:
+                rows = await cur.fetchall()
+                return [
+                    ChunkRecord(
+                        id=r["id"],
+                        document_id=r["document_id"],
+                        thread_id=r["thread_id"],
+                        idx=r["idx"],
+                        text=r["text"],
+                        token_count=r["token_count"],
+                        embedding=r["embedding"],
+                        embedding_model=r["embedding_model"],
+                        embedding_dim=r["embedding_dim"],
+                        meta=json.loads(r["meta_json"] or "{}")
+                    )
+                    for r in rows
+                ]
+
+    async def list_chunks_needing_reindex(
+        self,
+        thread_id: str,
+        target_model: str
+    ) -> List[ChunkRecord]:
+        """Fetch chunks that were embedded with a different model or have no embedding."""
+        async with get_db(self.db_path) as db:
+            async with db.execute(
+                """
+                SELECT * FROM chunks
+                WHERE thread_id = ? AND (embedding_model IS NULL OR embedding_model != ?)
+                ORDER BY idx ASC;
+                """,
+                (thread_id, target_model)
+            ) as cur:
+                rows = await cur.fetchall()
+                return [
+                    ChunkRecord(
+                        id=r["id"],
+                        document_id=r["document_id"],
+                        thread_id=r["thread_id"],
+                        idx=r["idx"],
+                        text=r["text"],
+                        token_count=r["token_count"],
+                        embedding=r["embedding"],
+                        embedding_model=r["embedding_model"],
+                        embedding_dim=r["embedding_dim"],
+                        meta=json.loads(r["meta_json"] or "{}")
+                    )
+                    for r in rows
+                ]
+
+    async def update_chunk_embedding(
+        self,
+        chunk_id: str,
+        embedding: bytes,
+        embedding_model: str,
+        embedding_dim: int
+    ) -> bool:
+        """Update the embedding vector and model metadata for an individual chunk."""
+        async with get_db(self.db_path) as db:
+            await db.execute(
+                """
+                UPDATE chunks
+                SET embedding = ?, embedding_model = ?, embedding_dim = ?
+                WHERE id = ?;
+                """,
+                (embedding, embedding_model, embedding_dim, chunk_id)
+            )
+            await db.commit()
+            return True
+
+    async def delete_chunks_by_document(self, document_id: str) -> int:
+        async with get_db(self.db_path) as db:
+            async with db.execute(
+                "DELETE FROM chunks WHERE document_id = ?;",
+                (document_id,)
+            ) as cur:
+                deleted = cur.rowcount
+            await db.commit()
+            return deleted

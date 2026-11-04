@@ -29,6 +29,7 @@ def test_get_agent_llm_fails_loudly_without_gemini_key(monkeypatch):
     assert "GEMINI_API_KEY is required" in str(exc_info.value)
 
 
+@pytest.mark.slow
 def test_critic_model_defaults_to_gemini_model(monkeypatch):
     """Verify CRITIC_MODEL defaults to GEMINI_MODEL when unset."""
     set_global_llm(None)

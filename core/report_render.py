@@ -4,18 +4,20 @@ Ensures citation grounding by stripping invalid URLs, dropping ungrounded claims
 and rendering clean, predictable Markdown without filler text.
 """
 
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 from core.state import StructuredReport, Section, Claim, SourceItem
 from core.critic_checks import normalize_url
 
 
 def validate_structured_report(
     structured: StructuredReport,
-    retrieved_sources: List[SourceItem]
+    retrieved_sources: List[SourceItem],
+    retrieved_chunks: Optional[List[Any]] = None
 ) -> StructuredReport:
-    """Validate structured report against retrieved sources.
+    """Validate structured report against retrieved sources and chunks.
 
-    - Strips URLs not present in retrieved sources.
+    - Strips URLs not present in retrieved sources or retrieved chunks.
+    - Filters claim.chunk_ids to verified chunk IDs.
     - Drops claims left with zero valid URLs.
     - Moves dropped claim topics into open_gaps.
     - Truncates TL;DR to at most 5 items.
@@ -26,6 +28,13 @@ def validate_structured_report(
         for s in retrieved_sources
         if s.url
     }
+
+    valid_chunk_ids = set()
+    if retrieved_chunks:
+        for c in retrieved_chunks:
+            valid_chunk_ids.add(c.id)
+            if getattr(c, "source_url", None):
+                valid_url_set.add(normalize_url(c.source_url))
 
     open_gaps = list(structured.open_gaps)
     valid_sections: List[Section] = []
@@ -38,11 +47,13 @@ def validate_structured_report(
                 if normalize_url(u) in valid_url_set
             ]
             if grounded_urls:
+                kept_chunks = [cid for cid in claim.chunk_ids if cid in valid_chunk_ids] if valid_chunk_ids else list(claim.chunk_ids)
                 kept_claims.append(
                     Claim(
                         text=claim.text.strip(),
                         source_urls=grounded_urls,
-                        confidence=claim.confidence
+                        confidence=claim.confidence,
+                        chunk_ids=kept_chunks
                     )
                 )
             else:

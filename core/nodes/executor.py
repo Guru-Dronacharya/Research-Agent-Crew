@@ -11,12 +11,21 @@ import os
 import asyncio
 from typing import Dict, Any, List, Optional
 from pydantic import BaseModel
-from core.state import AgentState, SubtaskResult, SourceItem, TraceEvent, Subtask
+from core.state import AgentState, SubtaskResult, SourceItem, TraceEvent, Subtask, RetrievedChunk
 from core.tracer import TraceLogger
 from mcp_tools.client import MCPClientManager
 from core.timing import timed_node, record_tool_call_timing, log_timing_event
 from core.cache import get_search_cache
 from core.cancellation import is_cancellation_requested, RunCancelledError
+from core.db import DocumentRepo, ChunkRepo
+from core.rag import (
+    Embedder,
+    get_embedder,
+    fetch_and_extract_page,
+    ingest_document_text,
+    query_hybrid_rag,
+    RAG_MIN_SCORE,
+)
 
 
 class SubtaskExecutionOutput(BaseModel):
@@ -30,6 +39,7 @@ class SubtaskExecutionOutput(BaseModel):
     searches_spent: int = 0
     cache_hits: int = 0
     trace_events: List[TraceEvent] = []
+    retrieved_chunks: List[RetrievedChunk] = []
 
 
 async def _execute_single_subtask(
@@ -41,7 +51,9 @@ async def _execute_single_subtask(
     total_searches_snapshot: int,
     timeout_sec: float,
     state_timings: Optional[Dict[str, Any]],
-    run_id: Optional[str] = None
+    run_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
+    embedder: Optional[Embedder] = None
 ) -> SubtaskExecutionOutput:
     """Execute a single subtask within its dedicated budget share."""
     subtask_trace_events: List[TraceEvent] = []
@@ -527,8 +539,86 @@ async def _execute_single_subtask(
                             )
                             findings_snippets.append(f"{title}: {snippet}")
 
-        # 6. Synthesize subtask findings
-        if findings_snippets:
+        # 6. RAG Ingestion and Hybrid Retrieval
+        retrieved_subtask_chunks: List[RetrievedChunk] = []
+        rag_gap = True
+        effective_thread_id = thread_id or f"transient-{run_id or 'default'}"
+        if embedder is None:
+            embedder = get_embedder()
+        doc_repo = DocumentRepo()
+        chunk_repo = ChunkRepo()
+
+        # Ingest collected sources up to fetch budget
+        for s in collected_sources:
+            try:
+                page = await fetch_and_extract_page(
+                    url=s.url,
+                    title=s.title,
+                    snippet=s.snippet
+                )
+                doc_rec, is_dup, indexed_chunks = await ingest_document_text(
+                    thread_id=effective_thread_id,
+                    text=page.text,
+                    title=s.title,
+                    url_or_name=s.url,
+                    kind="web",
+                    embedder=embedder,
+                    document_repo=doc_repo,
+                    chunk_repo=chunk_repo,
+                    run_id=run_id,
+                    meta={"snippet_only": page.snippet_only}
+                )
+                await emit_run_event(
+                    run_id=run_id,
+                    event_type="document_fetched",
+                    node="executor",
+                    subtask_id=subtask.id,
+                    data={
+                        "url": s.url,
+                        "title": s.title,
+                        "char_count": len(page.text),
+                        "duplicate": is_dup,
+                        "status": page.status
+                    }
+                )
+                if not is_dup and indexed_chunks:
+                    await emit_run_event(
+                        run_id=run_id,
+                        event_type="chunks_indexed",
+                        node="executor",
+                        subtask_id=subtask.id,
+                        data={
+                            "document_id": doc_rec.id,
+                            "chunk_count": len(indexed_chunks),
+                            "embedding_model": embedder.get_model_name(),
+                            "token_count": sum(c.token_count for c in indexed_chunks)
+                        }
+                    )
+            except Exception:
+                pass
+
+        # Query hybrid RAG for this subtask
+        search_query = f"{subtask.title} " + " ".join(subtask.search_queries[:2])
+        try:
+            retrieved_subtask_chunks, rag_gap = await query_hybrid_rag(
+                thread_id=effective_thread_id,
+                query=search_query,
+                embedder=embedder,
+                chunk_repo=chunk_repo,
+                document_repo=doc_repo,
+                top_k=5,
+                min_score=RAG_MIN_SCORE,
+                subtask_id=subtask.id
+            )
+        except Exception:
+            retrieved_subtask_chunks = []
+            rag_gap = True
+
+        # Synthesize subtask findings
+        if retrieved_subtask_chunks:
+            synthesized_text = " ".join(c.text for c in retrieved_subtask_chunks[:3])
+            evidence_gap = rag_gap
+        elif findings_snippets:
             synthesized_text = " ".join(findings_snippets[:4])
             evidence_gap = False
         else:
@@ -544,7 +634,8 @@ async def _execute_single_subtask(
             evidence_gap=evidence_gap,
             searches_spent=searches_spent,
             cache_hits=cache_hits_count,
-            trace_events=subtask_trace_events
+            trace_events=subtask_trace_events,
+            retrieved_chunks=retrieved_subtask_chunks
         )
 
     except Exception as exc:
@@ -655,6 +746,23 @@ async def executor_node(state: AgentState) -> Dict[str, Any]:
         for idx in range(num_pending)
     ]
 
+    thread_id = state.get("thread_id")
+    if not thread_id and run_id:
+        try:
+            from core.db import RunRepo
+            run_rec = await RunRepo().get_run(run_id)
+            if run_rec:
+                thread_id = run_rec.thread_id
+        except Exception:
+            pass
+    if not thread_id:
+        thread_id = f"thread-{run_id or 'default'}"
+
+    # Validate and obtain embedder upfront.
+    # In production, research runs must NEVER download models implicitly;
+    # if the model is missing, fail fast with a clear error instruction.
+    embedder = get_embedder()
+
     semaphore = asyncio.Semaphore(concurrency_limit)
 
     async def _bounded_subtask_exec(subtask: Subtask, share: int):
@@ -670,7 +778,9 @@ async def executor_node(state: AgentState) -> Dict[str, Any]:
                 total_searches_snapshot=total_searches,
                 timeout_sec=timeout_sec,
                 state_timings=state_timings,
-                run_id=run_id
+                run_id=run_id,
+                thread_id=thread_id,
+                embedder=embedder
             )
 
     tasks = [
@@ -694,7 +804,8 @@ async def executor_node(state: AgentState) -> Dict[str, Any]:
                 findings=out.findings,
                 sources=out.sources,
                 tools_invoked=out.tools_invoked,
-                evidence_gap=out.evidence_gap
+                evidence_gap=out.evidence_gap,
+                retrieved_chunks=out.retrieved_chunks
             )
         )
 

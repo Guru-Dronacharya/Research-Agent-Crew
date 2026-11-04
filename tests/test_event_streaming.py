@@ -73,6 +73,7 @@ def setup_test_environment(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.slow
 async def test_event_seq_strictly_monotonic_and_emission_order():
     """Events persisted to DB must have strictly monotonic sequence numbers matching emission order."""
     thread_repo = ThreadRepo()
@@ -96,6 +97,7 @@ async def test_event_seq_strictly_monotonic_and_emission_order():
 
 
 @pytest.mark.asyncio
+@pytest.mark.slow
 async def test_concurrent_subtasks_tag_subtask_id():
     """Executor running queries across multiple subtasks tags subtask_id on tool calls, results, and sources."""
     thread_repo = ThreadRepo()
@@ -121,6 +123,7 @@ async def test_concurrent_subtasks_tag_subtask_id():
 
 
 @pytest.mark.asyncio
+@pytest.mark.slow
 async def test_cross_process_db_tailing_without_gaps_or_duplicates(tmp_path, monkeypatch):
     """Run executes in child worker subprocess; parent subscribes through tail_run_events (DB-tail)
     and receives all events without gaps or duplicates.
@@ -179,6 +182,7 @@ async def test_cross_process_db_tailing_without_gaps_or_duplicates(tmp_path, mon
 
 
 @pytest.mark.asyncio
+@pytest.mark.slow
 async def test_last_event_id_and_after_seq_resume():
     """Streaming with after_seq skips already received events and returns only new ones."""
     thread_repo = ThreadRepo()
@@ -225,6 +229,7 @@ async def test_subscriber_queue_overflow_policy():
 
 
 @pytest.mark.asyncio
+@pytest.mark.slow
 async def test_mid_node_crash_persists_earlier_events():
     """If a node crashes midway, all events emitted up to that point remain persisted in SQLite."""
     thread_repo = ThreadRepo()
@@ -257,6 +262,7 @@ async def test_mid_node_crash_persists_earlier_events():
 
 
 @pytest.mark.asyncio
+@pytest.mark.slow
 async def test_no_duplicate_events_persisted_after_resume():
     """Resuming a paused or failed run must never duplicate previously persisted events."""
     thread_repo = ThreadRepo()
@@ -329,6 +335,7 @@ async def test_heartbeats_are_not_persisted_to_db():
 
 
 @pytest.mark.asyncio
+@pytest.mark.slow
 async def test_bus_cleanup_on_run_finish():
     """Event bus is cleanly closed and removed from registry after run terminates."""
     thread_repo = ThreadRepo()
@@ -343,6 +350,7 @@ async def test_bus_cleanup_on_run_finish():
     assert run.id not in _RUN_BUSES, "Per-run bus was not removed after run finished"
 
 
+@pytest.mark.slow
 def test_api_sse_stream_and_signed_token_authentication(monkeypatch):
     """API SSE endpoint /runs/{run_id}/events supports signed query tokens and streams events."""
     monkeypatch.setenv("API_KEY", "prod-secret-key-999")

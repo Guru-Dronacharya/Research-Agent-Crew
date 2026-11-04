@@ -13,7 +13,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Dict, Any, List, Optional
-from fastapi import FastAPI, HTTPException, Security, Request, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Security, Request, BackgroundTasks, UploadFile, File
 from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -25,7 +25,8 @@ from api.schemas import (
     SubtaskSummarySchema, TraceEventSummarySchema,
     ThreadCreateRequest, ThreadUpdateRequest, ThreadResponse,
     MessageResponse, RunCreateRequest, ResumeRunRequest,
-    RunResponse, RunEventResponse, ThreadExportResponse
+    RunResponse, RunEventResponse, ThreadExportResponse,
+    DocumentResponse
 )
 from core.graph import build_research_graph, create_initial_state
 from core.state import AgentState
@@ -35,7 +36,18 @@ from core.db.repositories import (
     ThreadRepo,
     MessageRepo,
     RunRepo,
-    EventRepo
+    EventRepo,
+    DocumentRepo,
+    ChunkRepo
+)
+from core.rag import (
+    parse_document_bytes,
+    stream_and_validate_upload_bytes,
+    sanitize_filename,
+    get_embedder,
+    ingest_document_text,
+    invalidate_thread_cache,
+    MAX_UPLOAD_MB
 )
 from core.services.runs import (
     start_run,
@@ -399,6 +411,114 @@ async def export_thread_endpoint(thread_id: str):
             for e in all_events
         ]
     )
+
+
+# ==============================================================================
+# Document Upload and RAG Management Endpoints
+# ==============================================================================
+
+@app.post("/threads/{thread_id}/documents", response_model=DocumentResponse)
+async def upload_document_endpoint(
+    thread_id: str,
+    file: UploadFile = File(...)
+):
+    """Upload and ingest a document (PDF or UTF-8 text/md) for a thread."""
+    thread = await ThreadRepo().get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    try:
+        content = await stream_and_validate_upload_bytes(file, max_mb=MAX_UPLOAD_MB)
+    except ValueError as exc:
+        if "exceeds maximum allowed upload limit" in str(exc):
+            raise HTTPException(status_code=413, detail=str(exc))
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    clean_filename = sanitize_filename(file.filename or "uploaded_document")
+
+    try:
+        text, detected_type, page_count = await parse_document_bytes(content, filename=clean_filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except TimeoutError as exc:
+        raise HTTPException(status_code=408, detail=str(exc))
+
+    try:
+        embedder = get_embedder()
+        doc_repo = DocumentRepo()
+        chunk_repo = ChunkRepo()
+
+        doc_rec, is_dup, chunks = await ingest_document_text(
+            thread_id=thread_id,
+            text=text,
+            title=clean_filename,
+            url_or_name=clean_filename,
+            kind="upload",
+            embedder=embedder,
+            document_repo=doc_repo,
+            chunk_repo=chunk_repo,
+            meta={"page_count": page_count, "detected_type": detected_type, "original_filename": file.filename}
+        )
+
+        return DocumentResponse(
+            id=doc_rec.id,
+            thread_id=doc_rec.thread_id,
+            kind=doc_rec.kind,
+            title=doc_rec.title,
+            url_or_name=doc_rec.url_or_name,
+            content_hash=doc_rec.content_hash,
+            status=doc_rec.status,
+            created_at=doc_rec.created_at,
+            chunk_count=len(chunks) if not is_dup else doc_rec.chunk_count,
+            run_id=doc_rec.run_id,
+            meta=doc_rec.meta,
+            is_duplicate=is_dup
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to ingest document: {exc}")
+
+
+@app.get("/threads/{thread_id}/documents", response_model=List[DocumentResponse])
+async def list_thread_documents_endpoint(thread_id: str):
+    """List all documents ingested or uploaded for a thread."""
+    thread = await ThreadRepo().get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    docs = await DocumentRepo().list_documents_by_thread(thread_id)
+    return [
+        DocumentResponse(
+            id=d.id,
+            thread_id=d.thread_id,
+            kind=d.kind,
+            title=d.title,
+            url_or_name=d.url_or_name,
+            content_hash=d.content_hash,
+            status=d.status,
+            created_at=d.created_at,
+            chunk_count=d.chunk_count,
+            run_id=d.run_id,
+            meta=d.meta,
+            is_duplicate=d.is_duplicate
+        )
+        for d in docs
+    ]
+
+
+@app.delete("/documents/{document_id}")
+async def delete_document_endpoint(document_id: str):
+    """Delete a document and its indexed chunks."""
+    doc_repo = DocumentRepo()
+    doc = await doc_repo.get_document(document_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    deleted = await doc_repo.delete_document(document_id)
+    if not deleted:
+        raise HTTPException(status_code=500, detail="Failed to delete document")
+
+    invalidate_thread_cache(doc.thread_id)
+    return {"deleted": True, "document_id": document_id}
 
 
 # ==============================================================================

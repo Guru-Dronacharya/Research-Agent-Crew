@@ -39,7 +39,9 @@ VALID_EVENT_TYPES = {
     "stale",
     "decomposition",
     "rubric_evaluation",
-    "escalation"
+    "escalation",
+    "document_fetched",
+    "chunks_indexed"
 }
 
 SENSITIVE_KEY_SUBSTRINGS = ("api_key", "secret", "password", "token", "authorization")

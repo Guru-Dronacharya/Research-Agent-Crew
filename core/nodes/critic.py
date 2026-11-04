@@ -54,6 +54,7 @@ async def critic_node(state: AgentState) -> Dict[str, Any]:
     source_relevance = deterministic_metrics["source_relevance"]
     evidence_gap_rate = deterministic_metrics["evidence_gap_rate"]
     budget_respected = deterministic_metrics["budget_respected"]
+    unsupported_claim_rate = deterministic_metrics.get("unsupported_claim_rate", 0.0)
 
     # 2. Check if a hard-fail condition is already certain
     hard_fail_certain = (
@@ -191,6 +192,13 @@ async def critic_node(state: AgentState) -> Dict[str, Any]:
                 cap_note = f"[Hard Cap Applied: Evidence capped at 3 because source relevance ({source_relevance:.2f}) < 0.6]"
                 evaluation.evidence.rationale = f"{evaluation.evidence.rationale} {cap_note}".strip()
                 caps_fired.append(f"Evidence capped at 3 (source_relevance {source_relevance:.2f} < 0.6)")
+
+        if unsupported_claim_rate > 0.25:
+            if evaluation.evidence.score > 3:
+                evaluation.evidence.score = 3
+                cap_note = f"[Hard Cap Applied: Evidence capped at 3 because unsupported claim rate ({unsupported_claim_rate:.2f}) > 0.25]"
+                evaluation.evidence.rationale = f"{evaluation.evidence.rationale} {cap_note}".strip()
+                caps_fired.append(f"Evidence capped at 3 (unsupported_claim_rate {unsupported_claim_rate:.2f} > 0.25)")
 
         evaluation.total_score = (
             evaluation.coverage.score + evaluation.evidence.score + evaluation.coherence.score

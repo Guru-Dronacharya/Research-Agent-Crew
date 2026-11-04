@@ -1,4 +1,4 @@
-﻿"""Streamlit Observability Dashboard for Research Agent Crew.
+"""Streamlit Observability Dashboard for Research Agent Crew.
 
 Provides an interactive user interface to manage persistent research threads,
 track background multi-agent runs, inspect checkpoints and Critic scorecards,
@@ -42,7 +42,16 @@ from core.db.repositories import (
     ThreadRepo,
     MessageRepo,
     RunRepo,
-    EventRepo
+    EventRepo,
+    DocumentRepo,
+    ChunkRepo
+)
+from core.rag import (
+    parse_document_bytes,
+    sanitize_filename,
+    get_embedder,
+    ingest_document_text,
+    invalidate_thread_cache
 )
 from core.services.runs import (
     start_run,
@@ -449,10 +458,11 @@ if latest_run and latest_run.report_md:
         except Exception:
             pass
 
-    tab_report, tab_trace, tab_sources = st.tabs([
+    tab_report, tab_trace, tab_sources, tab_docs = st.tabs([
         "📄 Final Research Report",
         "🔍 Observability & Run Events",
-        "🌐 Discovered Citations"
+        "🌐 Discovered Citations",
+        "📁 Sources & Documents"
     ])
 
     with tab_report:
@@ -573,4 +583,81 @@ if latest_run and latest_run.report_md:
                 st.info("No sources explicitly cited.")
         else:
             st.info("Source citations embedded in markdown report.")
+
+    with tab_docs:
+        st.subheader("Thread Documents & Ingested Sources")
+
+        # Document upload widget
+        st.markdown("#### 📤 Upload Documents")
+        uploaded_file = st.file_uploader(
+            "Upload reference document (PDF or UTF-8 Text / Markdown, max 25MB)",
+            type=["pdf", "txt", "md"],
+            key=f"uploader_{active_thread.id}"
+        )
+        if uploaded_file is not None:
+            if st.button("Index Document for Thread", key=f"btn_idx_{active_thread.id}"):
+                with st.spinner("Parsing and indexing document..."):
+                    try:
+                        file_bytes = uploaded_file.read()
+                        clean_name = sanitize_filename(uploaded_file.name)
+                        text, kind, page_count = runner.run_sync(
+                            parse_document_bytes(file_bytes, filename=clean_name)
+                        )
+                        embedder = get_embedder()
+                        doc_repo = DocumentRepo()
+                        chunk_repo = ChunkRepo()
+
+                        doc_rec, is_dup, chunks = runner.run_sync(
+                            ingest_document_text(
+                                thread_id=active_thread.id,
+                                text=text,
+                                title=clean_name,
+                                url_or_name=clean_name,
+                                kind="upload",
+                                embedder=embedder,
+                                document_repo=doc_repo,
+                                chunk_repo=chunk_repo,
+                                meta={"page_count": page_count, "detected_type": kind}
+                            )
+                        )
+                        if is_dup:
+                            st.info(f"Document '{clean_name}' already indexed for this thread ({doc_rec.chunk_count} chunks).")
+                        else:
+                            st.success(f"Successfully indexed '{clean_name}': {len(chunks)} chunks created.")
+                        st.rerun()
+                    except Exception as upload_err:
+                        st.error(f"Failed to process document: {upload_err}")
+
+        st.markdown("---")
+        st.markdown("#### 📚 Ingested Documents & Sources")
+        doc_repo = DocumentRepo()
+        thread_docs = runner.run_sync(doc_repo.list_documents_by_thread(active_thread.id))
+        if thread_docs:
+            doc_data = []
+            for d in thread_docs:
+                doc_data.append({
+                    "Type": "🌐 Web" if d.kind == "web" else "📄 Upload",
+                    "Title": d.title,
+                    "Chunks": d.chunk_count,
+                    "Status": d.status,
+                    "Added": d.created_at[:19].replace("T", " "),
+                    "ID": d.id
+                })
+            st.dataframe(doc_data, use_container_width=True)
+
+            # Option to delete an uploaded document
+            del_doc_id = st.selectbox(
+                "Select Document to Remove",
+                options=[""] + [d.id for d in thread_docs if d.kind == "upload"],
+                format_func=lambda x: next((f"{d.title} ({d.id[:8]}...)" for d in thread_docs if d.id == x), "Select document..."),
+                key=f"del_sel_{active_thread.id}"
+            )
+            if del_doc_id and st.button("Delete Document", type="secondary", key=f"btn_del_{del_doc_id}"):
+                deleted = runner.run_sync(doc_repo.delete_document(del_doc_id))
+                if deleted:
+                    invalidate_thread_cache(active_thread.id)
+                    st.success("Document deleted.")
+                    st.rerun()
+        else:
+            st.info("No documents or web pages ingested for this thread yet.")
 

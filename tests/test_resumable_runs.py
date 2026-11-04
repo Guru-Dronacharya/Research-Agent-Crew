@@ -63,6 +63,7 @@ async def test_completed_runs_not_resumable():
 
 
 @pytest.mark.asyncio
+@pytest.mark.slow
 async def test_quota_exceeded_pauses_with_resume_after_and_refuses_early_resume():
     """QuotaExceededError pauses run with resume_after timestamp; early resume is refused unless force=True."""
     thread_repo = ThreadRepo()
@@ -147,6 +148,7 @@ async def test_cancel_stops_run_cooperatively():
 
 
 @pytest.mark.asyncio
+@pytest.mark.slow
 async def test_interrupted_run_resumes_without_rerunning_completed_subtasks(monkeypatch):
     """An interrupted run resumes from checkpoint without re-running completed subtasks or duplicating searches."""
     thread_repo = ThreadRepo()
@@ -209,6 +211,7 @@ async def test_interrupted_run_resumes_without_rerunning_completed_subtasks(monk
 
 
 @pytest.mark.asyncio
+@pytest.mark.slow
 async def test_real_subprocess_kill_and_resumption(tmp_path, monkeypatch):
     """Real kill test:
     1. Spawn run in worker subprocess.
@@ -343,6 +346,7 @@ async def test_real_subprocess_kill_and_resumption(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.slow
 async def test_critic_event_ordering_and_seq_order():
     """Critic must emit rubric_evaluation before escalation, and run_events seq order
     strictly matches emission order across a resume."""

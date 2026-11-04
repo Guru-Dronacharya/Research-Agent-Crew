@@ -56,6 +56,7 @@ def test_api_key_auth_enforcement_and_health_bypass(monkeypatch):
         assert resp_bearer.status_code == 200
 
 
+@pytest.mark.slow
 def test_thread_and_run_lifecycle_api_endpoints():
     """Full lifecycle testing via REST API: thread CRUD, run launch, status check, and export."""
     with TestClient(app) as client:

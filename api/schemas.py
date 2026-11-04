@@ -148,3 +148,19 @@ class ThreadExportResponse(BaseModel):
     messages: List[MessageResponse]
     runs: List[RunResponse]
     events: List[RunEventResponse]
+
+
+class DocumentResponse(BaseModel):
+    """Representation of an ingested document or thread upload."""
+    id: str
+    thread_id: str
+    kind: str
+    title: str
+    url_or_name: str
+    content_hash: str
+    status: str
+    created_at: str
+    chunk_count: int = 0
+    run_id: Optional[str] = None
+    meta: Dict[str, Any] = Field(default_factory=dict)
+    is_duplicate: bool = False
