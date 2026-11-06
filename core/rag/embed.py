@@ -102,8 +102,16 @@ class FastEmbedEmbedder(Embedder):
         self._init_model()
 
     def _init_model(self) -> None:
-        from fastembed import TextEmbedding
+        if not os.path.exists(self.cache_dir) or not os.listdir(self.cache_dir):
+            raise RuntimeError(
+                f"Embedding model '{self.model_name}' was not found in cache directory '{self.cache_dir}'.\n"
+                f"Research runs must NEVER trigger implicit model downloads.\n"
+                f"Please download the model explicitly first by executing:\n"
+                f"    python -m core.rag.download_model\n"
+                f"Error detail: Cache directory is missing or empty."
+            )
 
+        from fastembed import TextEmbedding
         os.makedirs(self.cache_dir, exist_ok=True)
         try:
             # Enforce local_files_only: never download implicitly in a run

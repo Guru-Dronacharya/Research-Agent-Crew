@@ -18,6 +18,57 @@ from core.ratelimit import get_llm_rate_limiter
 class StubLLM(BaseAgentLLM):
     """Deterministic test double for agent reasoning in automated test suites."""
 
+    def __init__(self):
+        self.scripted_streaming_deltas: Optional[List[str]] = None
+        self.simulate_pre_stream_quota_error: bool = False
+        self.simulate_mid_stream_quota_error: bool = False
+        self.stream_delay_seconds: float = 0.0
+        self.stream_calls_count: int = 0
+
+    async def astream_chat(
+        self,
+        messages: List[Dict[str, str]],
+        model_name: Optional[str] = None
+    ):
+        """Deterministic streaming chat generator for tests."""
+        import asyncio
+        from core.ratelimit import QuotaExceededError
+
+        self.stream_calls_count += 1
+        await get_llm_rate_limiter().acquire(model=model_name or "stub-model")
+
+        if self.simulate_pre_stream_quota_error:
+            raise QuotaExceededError(
+                "Google Gemini daily quota exceeded for model 'stub-model'. Resets at midnight Pacific Time (PT).",
+                reset_time="midnight Pacific Time (PT)"
+            )
+
+        if self.scripted_streaming_deltas is not None:
+            deltas = list(self.scripted_streaming_deltas)
+        else:
+            last_msg = messages[-1].get("content", "") if messages else ""
+            deltas = [
+                f"Answer for '{last_msg[:30]}': ",
+                "Supported by evidence [chunk-1] ",
+                "and further verified by [chunk-2]."
+            ]
+
+        if self.simulate_mid_stream_quota_error:
+            # Yield partial tokens before quota error
+            if deltas:
+                yield deltas[0]
+            if len(deltas) > 1:
+                yield deltas[1]
+            raise QuotaExceededError(
+                "Google Gemini daily quota exceeded mid-stream for model 'stub-model'. Resets at midnight Pacific Time (PT).",
+                reset_time="midnight Pacific Time (PT)"
+            )
+
+        for d in deltas:
+            if self.stream_delay_seconds > 0:
+                await asyncio.sleep(self.stream_delay_seconds)
+            yield d
+
     async def generate_plan(
         self,
         task: str,

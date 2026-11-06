@@ -72,6 +72,7 @@ async def test_mcp_timeout_handling():
     assert res["status"] == "error"
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_mcp_tool_timeout_enforcement():
     """Verify that a tool sleeping longer than timeout returns status 'timeout' within ~timeout seconds."""

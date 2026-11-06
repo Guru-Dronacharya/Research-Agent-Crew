@@ -362,6 +362,7 @@ def test_fake_deterministic_embedder():
     assert sim_diff < 0.90
 
 
+@pytest.mark.slow
 def test_fastembed_embedder_forbids_implicit_download():
     """Verify FastEmbedEmbedder raises RuntimeError when model is missing from cache_dir."""
     with pytest.raises(RuntimeError) as exc_info:
@@ -409,6 +410,7 @@ def test_embedder_singleton_thread_safety():
         reset_embedder_cache()
 
 
+@pytest.mark.critical
 def test_network_guard_blocks_outbound_connections():
     """Verify autouse network guard blocks outbound DNS and TCP connections while permitting loopback."""
     import socket
@@ -948,7 +950,9 @@ async def test_api_upload_oversized_returns_413(setup_test_env):
             api_app.MAX_UPLOAD_MB = orig_max
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
+@pytest.mark.critical
 async def test_executor_fails_fast_when_model_missing(tmp_path, monkeypatch):
     """Verify executor_node fails fast with clear instruction if real embedding model is missing."""
     from core.nodes.executor import executor_node

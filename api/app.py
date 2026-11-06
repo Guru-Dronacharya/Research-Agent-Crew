@@ -8,12 +8,13 @@ and resume/cancel execution runs with SQLite checkpointing.
 import os
 import hmac
 import hashlib
+import json
 from datetime import datetime, timezone
 import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Dict, Any, List, Optional
-from fastapi import FastAPI, HTTPException, Security, Request, BackgroundTasks, UploadFile, File
+from fastapi import FastAPI, HTTPException, Security, Request, BackgroundTasks, UploadFile, File, Depends
 from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -26,7 +27,8 @@ from api.schemas import (
     ThreadCreateRequest, ThreadUpdateRequest, ThreadResponse,
     MessageResponse, RunCreateRequest, ResumeRunRequest,
     RunResponse, RunEventResponse, ThreadExportResponse,
-    DocumentResponse
+    DocumentResponse,
+    ChatRequest, RouterClassifyRequest, RouterClassifyResponse
 )
 from core.graph import build_research_graph, create_initial_state
 from core.state import AgentState
@@ -38,8 +40,11 @@ from core.db.repositories import (
     RunRepo,
     EventRepo,
     DocumentRepo,
-    ChunkRepo
+    ChunkRepo,
+    ChatLockRepo
 )
+
+from core.chat import stream_thread_chat, ChatConflictError, classify_query
 from core.rag import (
     parse_document_bytes,
     stream_and_validate_upload_bytes,
@@ -756,7 +761,7 @@ async def run_research_sync(req: ResearchRequest):
         task=req.task,
         max_retries=req.max_retries,
         max_search_budget=req.max_search_budget,
-        model_name=req.model_name or os.environ.get("GEMINI_MODEL", "")
+        model_name=(req.model_name or os.environ.get("PLANNER_MODEL", "") or os.environ.get("GEMINI_MODEL", "") or os.environ.get("GROQ_MODEL", ""))
     )
 
     final_state: AgentState = await graph.ainvoke(initial_state)
@@ -826,7 +831,7 @@ async def _run_async_worker(task_id: str, req: ResearchRequest):
         task=req.task,
         max_retries=req.max_retries,
         max_search_budget=req.max_search_budget,
-        model_name=req.model_name or os.environ.get("GEMINI_MODEL", "")
+        model_name=(req.model_name or os.environ.get("PLANNER_MODEL", "") or os.environ.get("GEMINI_MODEL", "") or os.environ.get("GROQ_MODEL", ""))
     )
     TASKS[task_id]["state"] = initial_state
     TASKS[task_id]["status"] = "running"
@@ -921,6 +926,109 @@ async def list_saved_reports():
     """List all reports stored on disk via MCP Filesystem server."""
     res = await mcp_client.call_tool("list_reports", {})
     return res.get("output", {})
+
+
+
+# ==============================================================================
+# Thread Chat & Router Endpoints
+# ==============================================================================
+
+@app.post("/threads/{thread_id}/classify", response_model=RouterClassifyResponse)
+async def classify_thread_query_endpoint(
+    thread_id: str,
+    req: RouterClassifyRequest,
+    _auth: None = Depends(verify_api_key)
+):
+    """Classify a user query using zero-LLM heuristics into canned, thread, quick, or research."""
+    thread = await ThreadRepo().get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    target_text = req.text
+    if not target_text:
+        raise HTTPException(status_code=422, detail="Either 'query' or 'message' must be provided.")
+    decision = await classify_query(query=target_text, thread_id=thread_id)
+    return RouterClassifyResponse(
+        mode=decision.mode,
+        reason=decision.reason,
+        canned_response=decision.canned_response
+    )
+
+
+@app.post("/threads/{thread_id}/chat")
+async def thread_chat_sse_endpoint(
+    thread_id: str,
+    req: ChatRequest,
+    request: Request,
+    _auth: None = Depends(verify_api_key)
+):
+    """Stream grounded chat answer tokens, citations, and metadata over SSE."""
+    thread = await ThreadRepo().get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    # Fast-check conflict before entering generator (in-process + DB lock + research run status)
+    from core.chat.service import _ACTIVE_CHATS, _ACTIVE_CHATS_LOCK
+    async with _ACTIVE_CHATS_LOCK:
+        if thread_id in _ACTIVE_CHATS:
+            raise HTTPException(
+                status_code=409,
+                detail=f"A chat is already active on thread '{thread_id}'."
+            )
+    active_runs = await RunRepo().list_runs_by_thread(thread_id)
+    event_repo = EventRepo()
+    for r in active_runs:
+        if r.status in ("running", "executing", "pending"):
+            events = await event_repo.list_events_by_run(r.id)
+            current_node = None
+            for ev in reversed(events):
+                if ev.type == "node_started":
+                    current_node = ev.node
+                    break
+                elif ev.type == "node_finished":
+                    break
+            if current_node in ("synthesizer", "critic", "synthesis"):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Cannot chat while a research run ('{r.id}') is in {current_node} on thread '{thread_id}'."
+                )
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot chat while a research run ('{r.id}', status='{r.status}') is active on thread '{thread_id}'."
+            )
+    active_lock = await ChatLockRepo().get_active_lock(thread_id)
+    if active_lock:
+        raise HTTPException(
+            status_code=409,
+            detail=f"A chat is already active on thread '{thread_id}' (held by owner '{active_lock['owner_id']}')."
+        )
+
+    async def _event_generator():
+        try:
+            async for chat_ev in stream_thread_chat(
+                thread_id=thread_id,
+                message=req.message,
+                allow_general_knowledge=req.allow_general_knowledge,
+                mode=req.mode
+            ):
+                if await request.is_disconnected():
+                    break
+                yield {
+                    "event": chat_ev.event,
+                    "data": json.dumps(chat_ev.data)
+                }
+        except ChatConflictError as conflict_err:
+            yield {
+                "event": "error",
+                "data": json.dumps({"error": str(conflict_err), "code": 409})
+            }
+        except Exception as exc:
+            yield {
+                "event": "error",
+                "data": json.dumps({"error": str(exc)})
+            }
+
+    return EventSourceResponse(_event_generator())
 
 
 if __name__ == "__main__":

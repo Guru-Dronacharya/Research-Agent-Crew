@@ -55,6 +55,7 @@ async def test_full_graph_execution():
 
 
 @pytest.mark.asyncio
+@pytest.mark.critical
 async def test_search_budget_enforcement():
     """Verify that search budget ceiling prevents runaway searches."""
     graph = build_research_graph()
@@ -98,7 +99,9 @@ async def test_revision_pass_performs_search_with_budget():
     assert final_state["total_searches_performed"] <= 10
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
+@pytest.mark.critical
 async def test_total_searches_never_exceeds_budget_ceiling():
     """Verify that total searches performed never exceeds max_search_budget across multiple runs."""
     graph = build_research_graph()

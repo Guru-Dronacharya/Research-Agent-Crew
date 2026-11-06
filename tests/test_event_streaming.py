@@ -139,6 +139,7 @@ async def test_cross_process_db_tailing_without_gaps_or_duplicates(tmp_path, mon
     env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
 
     # Spawn worker subprocess to execute the run
+    ready_file = tmp_path / "worker_ready.signal"
     cmd = [
         sys.executable,
         "-u",
@@ -146,7 +147,9 @@ async def test_cross_process_db_tailing_without_gaps_or_duplicates(tmp_path, mon
         "scripts.run_worker",
         "--run-id",
         run.id,
-        "--critic-pass"
+        "--critic-pass",
+        "--ready-file",
+        str(ready_file)
     ]
     worker_log = tmp_path / "worker_streaming.log"
     log_file_handle = open(worker_log, "w", encoding="utf-8")
@@ -157,6 +160,12 @@ async def test_cross_process_db_tailing_without_gaps_or_duplicates(tmp_path, mon
         text=True,
         env=env
     )
+
+    # Wait for explicit child process readiness signal
+    for _ in range(150):
+        if ready_file.exists():
+            break
+        await asyncio.sleep(0.05)
 
     # Parent streams events via tail_run_events
     collected_events: list[RunEvent] = []
@@ -230,6 +239,7 @@ async def test_subscriber_queue_overflow_policy():
 
 @pytest.mark.asyncio
 @pytest.mark.slow
+@pytest.mark.critical
 async def test_mid_node_crash_persists_earlier_events():
     """If a node crashes midway, all events emitted up to that point remain persisted in SQLite."""
     thread_repo = ThreadRepo()

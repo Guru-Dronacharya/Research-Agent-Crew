@@ -94,6 +94,22 @@ def setup_mock_search():
     set_global_tool("search_web", mock_search)
 
 
+def setup_mock_fetch():
+    """Register deterministic offline page fetch stub for child subprocess."""
+    from core.rag.fetch import FetchedPage
+    import core.nodes.executor as executor_mod
+
+    async def _stub_fetch(url: str, title: str = "", snippet: str = "", **kwargs) -> FetchedPage:
+        return FetchedPage(
+            url=url,
+            title=title,
+            text=snippet.strip() or f"Evidence text for {title}",
+            snippet_only=True,
+            status="snippet_fallback"
+        )
+    executor_mod.fetch_and_extract_page = _stub_fetch
+
+
 async def main():
     parser = argparse.ArgumentParser(description="Research Agent Crew Worker")
     parser.add_argument("--run-id", type=str, help="Existing run ID to execute")
@@ -102,12 +118,12 @@ async def main():
     parser.add_argument("--config", type=str, default="{}", help="JSON config for run")
     parser.add_argument(
         "--kill-point",
-        type=str,
         choices=["none", "executor"],
         default="none",
         help="Where to pause and signal parent for process.kill()"
     )
     parser.add_argument("--signal-file", type=str, help="File to write when kill point is reached")
+    parser.add_argument("--ready-file", type=str, help="File to write when worker initialization is complete")
     parser.add_argument("--critic-pass", action="store_true", help="Critic test double always returns PASS")
     args = parser.parse_args()
 
@@ -120,8 +136,9 @@ async def main():
     else:
         set_global_llm(StubLLM())
 
-    # Setup search test double
+    # Setup search and page fetch test doubles
     setup_mock_search()
+    setup_mock_fetch()
 
     thread_repo = ThreadRepo()
 
@@ -158,6 +175,14 @@ async def main():
             return await orig_synth(state)
 
         graph_module.synthesizer_node = pausing_synthesizer
+
+    # Signal parent that worker setup is complete and execution is starting
+    if args.ready_file:
+        try:
+            with open(args.ready_file, "w", encoding="utf-8") as f:
+                f.write(f"ready:{target_run_id}\n")
+        except Exception as e:
+            print(f"Error writing ready file: {e}", flush=True)
 
     print(f"WORKER_STARTING:{target_run_id}", flush=True)
     finished_run = await execute_run(target_run_id)

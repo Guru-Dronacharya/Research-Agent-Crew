@@ -7,6 +7,7 @@ from core.nodes.executor import executor_node
 from mcp_tools.client import MCPClientManager
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_executor_parallel_speedup():
     """Verify that two subtasks with 1.0s delay each run concurrently in ~1.0s total, not ~2.0s."""
@@ -120,7 +121,9 @@ async def test_executor_failing_subtask_does_not_abort_others():
     assert len(results["s_good"].sources) == 1
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
+@pytest.mark.critical
 async def test_executor_strict_budget_ceiling_under_parallelism():
     """Verify that total searches performed never exceeds max_search_budget and shares are respected."""
     client = MCPClientManager()

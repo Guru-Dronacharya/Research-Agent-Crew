@@ -1,6 +1,6 @@
 # Research Agent Crew
 
-Production-grade autonomous multi-agent research crew orchestrated via **LangGraph**, **Google Gemini**, and **Model Context Protocol (MCP)** tools.
+Production-grade autonomous multi-agent research crew orchestrated via **LangGraph**, **Google Gemini** / **Groq**, and **Model Context Protocol (MCP)** tools.
 
 ## Architecture
 
@@ -44,7 +44,7 @@ The system executes a cyclical research workflow:
 
 ## Prerequisites & Configuration
 
-The application requires a valid Google Gemini API key and model specification.
+The application supports both **Google Gemini** and **Groq** via a unified provider abstraction (`LLM_PROVIDER=gemini|groq`).
 
 Create a `.env` file from `.env.example`:
 
@@ -52,202 +52,163 @@ Create a `.env` file from `.env.example`:
 cp .env.example .env
 ```
 
-### Required Environment Variables
+### Provider Configuration
 
-- `GEMINI_API_KEY`: API key for Google Gemini.
-- `GEMINI_MODEL`: Model ID for planning, execution, and synthesis (e.g. `gemini-2.0-flash`, `gemini-1.5-pro`).
+#### Option A: Groq (Free Tier / Production)
+Set in `.env`:
+```bash
+LLM_PROVIDER=groq
+GROQ_API_KEY=your_groq_api_key_here
+GROQ_MODEL=your_chosen_model_name
+GROQ_STRUCTURED_MODE=function_calling
+```
+- **Structured Output Modes**: `function_calling` (default for tool-capable models), `json_schema`, or `json_mode`. No model-name assumptions are hardcoded; mode is selected entirely via `GROQ_STRUCTURED_MODE`.
+- Run `python scripts/smoke_llm.py` before running the app to probe your model's supported structured output mode and streaming latency.
 
-### Optional Environment Variables
+#### Option B: Google Gemini
+Set in `.env`:
+```bash
+LLM_PROVIDER=gemini
+GEMINI_API_KEY=your_gemini_api_key_here
+GEMINI_MODEL=gemini-2.0-flash
+```
 
-- `PLANNER_MODEL`: Model used for task decomposition (defaults to `GEMINI_MODEL`).
-- `SYNTH_MODEL`: Model used for report synthesis (defaults to `GEMINI_MODEL`).
-- `CRITIC_MODEL`: Model used by the Critic LLM judge (defaults to `GEMINI_MODEL`).
-- `EXECUTOR_CONCURRENCY`: Max concurrent subtask executions (default `3`).
-- `LLM_RPM`: Requests per minute limit for Gemini LLM calls (default `15`).
-- `SEARCH_RPM`: Requests per minute limit for web search calls (default `30`).
-- `LLM_RPD`: Daily Gemini request cap that raises `QuotaExceededError` and escalates gracefully (default: None).
-- `DDGS_BACKENDS`: Comma-delimited DuckDuckGo search engines (default `duckduckgo,wikipedia`).
-- `DDGS_TIMEOUT_SEC`: Max per-search timeout for DuckDuckGo (default `6.0`).
-- `CACHE_ENABLED`: Enable SQLite search caching (default `true`).
-- `CACHE_DB_PATH`: File path to SQLite search cache database (default `.cache/search.db`).
-- `CACHE_TTL_SECONDS`: Cache time-to-live in seconds (default `21600` = 6 hours; empty results capped to 10 min).
-- `SYNTH_MAX_SOURCES_PER_SUBTASK`: Max sources passed per subtask to synthesizer (default `4`).
-- `SYNTH_SNIPPET_MAX_CHARS`: Max snippet length per source passed to synthesizer (default `300`).
-- `MCP_TOOL_TIMEOUT_SEC`: Timeout in seconds for MCP tool executions (default `15.0`).
-- `INITIAL_BUDGET_FRACTION`: Fraction of total search budget allocated to the initial pass (default `0.6`).
-- `MAX_RETRIES`: Maximum Critic reflection loops before finalizer (default `1`).
-- `SEARCH_BUDGET`: Hard limit on MCP web searches across iterations (default `10`).
-- `TAVILY_API_KEY`: Optional API key for Tavily search provider.
-- `BRAVE_API_KEY`: Optional API key for Brave search provider.
-- `DATABASE_PATH`: SQLite file path for persistent threads, messages, runs, and events (default `data/app.db`).
-- `CHECKPOINT_DB_PATH`: SQLite checkpointer path for LangGraph node state checkpoints (default `data/checkpoints.db`).
-- `HEARTBEAT_STALE_SECONDS`: Heartbeat staleness threshold in seconds for orphaned run recovery (default `60`).
-- `CORS_ORIGINS`: Comma-separated allowed origins for REST API (default `http://localhost:3000,http://localhost:8501`).
-- `API_KEY`: Optional shared secret header (`X-API-Key` or `Authorization: Bearer <key>`) enforced using constant-time comparison on all routes except `/health`.
+### Rate Limiting & Quota Management (Tokens & Requests)
+
+Both requests and tokens are tracked in a persistent SQLite quota database (`.cache/quota.db`) with sliding windows and configurable daily reset boundaries:
+
+- `LLM_RPM`: Requests per minute limit (default `15`).
+- `LLM_RPD`: Requests per day limit (default: None).
+- `LLM_TPM`: Tokens per minute limit (default: None / 0 for unlimited).
+- `LLM_TPD`: Tokens per day limit (default: None / 0 for unlimited).
+- `LLM_DAY_RESET`: Daily reset boundary mode:
+  - `pacific_midnight`: Midnight Pacific Time (Google Gemini default).
+  - `utc_midnight`: Midnight UTC (Groq default).
+  - `rolling_24h`: Continuous 24-hour sliding window.
+- `LLM_LIMITS_FILE`: Optional path to a JSON file mapping per-model rate limits (e.g. `data/limits.json`).
+
+#### Finding Your Limits in the Groq Console
+1. Log in to [Groq Console](https://console.groq.com/).
+2. Navigate to **Settings** $\to$ **Limits**.
+3. Locate your chosen model to view its exact RPM, RPD, TPM, and TPD allocations.
+4. Copy these into your `.env` or `LLM_LIMITS_FILE`.
+
+### Per-Role Model and Token Sizing
+
+- `PLANNER_MODEL`, `SYNTH_MODEL`, `CRITIC_MODEL`, `CHAT_MODEL`: Optional per-step model overrides.
+- `PLANNER_MAX_TOKENS`: Max tokens for planner subtask decomposition (default `2048`).
+- `CRITIC_MAX_TOKENS`: Max tokens for critic evaluation judge (default `2048`).
+- `SYNTH_MAX_TOKENS`: Max tokens for report synthesis (default `4096`).
+- `CHAT_MAX_TOKENS`: Max tokens for chat responses (default `2048`).
+
+If a model terminates with `finish_reason=length`, the system retries once with an expanded token budget if within TPM/TPD limits.
 
 ---
 
-## Threads, Resuming, and Quotas
+## Live Provider Smoke Test
 
-The system persists conversation history, runs, and telemetry events in SQLite (`data/app.db`) in WAL mode with foreign keys enabled, and persists LangGraph node states using the official async SQLite checkpointer (`data/checkpoints.db`).
-
-1. **Persistent Conversation Threads**:
-   - Create, list, rename, archive, and delete threads.
-   - Auto-titling derives clean thread titles deterministically from the first 50 characters of user prompts without calling an LLM.
-   - Deleting a thread cascades across runs, messages, and run events, and purges all associated state checkpoints.
-
-2. **Resumable Runs & SQLite Checkpointing**:
-   - Each run is associated with a thread and tracked in a `runs` table with lifecycle states: `pending` $\to$ `running` $\to$ `completed` / `escalated` / `failed` / `paused_quota` / `cancelled`.
-   - Node-level state is checkpointed under `{thread_id}:{run_id}`.
-   - Resuming via `resume_run(run_id)` continues execution from the exact last successful node. Completed subtasks are never re-run, and search/LLM budgets are never double-counted.
-   - At application startup, running runs without a fresh heartbeat within 60s are automatically marked `failed` with reason `interrupted` and can be resumed.
-
-3. **Daily Quota Pausing & Scheduling**:
-   - When Google Gemini daily quota is exhausted (429 with long retry delay or local `LLM_RPD` threshold), the run transitions to `paused_quota` with `resume_after` set to the midnight Pacific Time reset boundary.
-   - Resuming before `resume_after` is refused unless explicitly forced with `force=True`.
-
-4. **Cooperative Cancellation**:
-   - `cancel_run(run_id)` flags the run in memory and sets `cancel_requested = 1` in SQLite. Nodes and executor query loops poll this flag and halt execution cleanly.
-
-5. **REST API Version 2**:
-   - Thread endpoints: `GET /threads`, `POST /threads`, `GET/PATCH/DELETE /threads/{id}`, `GET /threads/{id}/messages`, `GET /threads/{id}/export`.
-   - Run endpoints: `POST /threads/{id}/runs`, `GET /runs/{id}`, `POST /runs/{id}/resume`, `POST /runs/{id}/cancel`.
-   - SSE telemetry endpoints: `GET /runs/{id}/events` (live SSE stream), `GET /runs/{id}/events/snapshot` (full persisted events JSON array), `POST /auth/sse-token` (short-lived signed tokens).
-   - Legacy in-memory task endpoints (`POST /research/run`, `POST /research/start`, `GET /research/{task_id}/status`) remain functional for backward compatibility but are **deprecated**.
-
-6. **Live Progress Streaming (SSE)**:
-   - Real-time progress events are emitted by nodes and persisted via a dedicated writer task to SQLite (`run_events` by `seq`). SQLite is the single source of truth.
-   - Server-Sent Events (SSE) endpoint `GET /runs/{run_id}/events` replays events (`seq > after_seq`), then tails SQLite using fast in-process bus wakeup (or 0.5s polling fallback across processes) until terminal state.
-   - Standardized event model: `{seq, run_id, ts, type, node, subtask_id, data}`.
-   - Event types: `run_started`, `node_started` (with `resumed=true` on resume), `node_finished`, `tool_call`, `tool_result`, `source_found`, `budget_alert`, `quota_paused`, `critic_verdict`, `report_section`, `run_finished`, `error`, `heartbeat`, `stale`.
-   - Payload size capped at `EVENT_PAYLOAD_MAX_BYTES` (default 8192) with automatic redaction of sensitive credentials.
-   - Transient heartbeats (`type=heartbeat`) sent every ~15s to keep connections alive without cluttering SQLite.
-
-### Browser EventSource Authentication & Examples
-
-> [!NOTE]
-> Standard browser `EventSource` cannot send custom headers (`X-API-Key` or `Authorization`).
-
-#### Option 1: Signed Query Token (Recommended for `EventSource`)
-```javascript
-// 1. Obtain short-lived signed token using standard API key
-const tokenRes = await fetch('/auth/sse-token', {
-  method: 'POST',
-  headers: { 'X-API-Key': 'YOUR_API_KEY' }
-});
-const { token } = await tokenRes.json();
-
-// 2. Open standard EventSource with ?token=
-const eventSource = new EventSource(`/runs/${runId}/events?token=${encodeURIComponent(token)}`);
-eventSource.onmessage = (event) => {
-  const data = JSON.parse(event.data);
-  console.log(`[seq=${event.lastEventId}]`, data);
-};
-```
-
-#### Option 2: `fetch()` with `ReadableStream`
-```javascript
-const response = await fetch(`/runs/${runId}/events`, {
-  headers: { 'X-API-Key': 'YOUR_API_KEY' }
-});
-const reader = response.body.getReader();
-const decoder = new TextDecoder();
-while (true) {
-  const { value, done } = await reader.read();
-  if (done) break;
-  console.log(decoder.decode(value));
-}
-```
-
-#### Option 3: PowerShell / Curl
-```powershell
-# PowerShell SSE stream
-curl.exe -N -H "X-API-Key: YOUR_API_KEY" http://localhost:8000/runs/<RUN_ID>/events
-```
-
----
-
-## Performance Tuning & Architecture Optimizations
-
-The pipeline is optimized for maximum speed and throughput while preserving all grounding and correctness guardrails:
-
-1. **Parallel Subtask & Query Execution**:
-   - The executor launches pending subtasks concurrently via `asyncio.gather`, bounded by `asyncio.Semaphore(EXECUTOR_CONCURRENCY)` (default: 3).
-   - Within each subtask, initial search queries run concurrently.
-   - Budget shares are pre-allocated per subtask, preventing shared counter race conditions.
-   - Subtask failures are isolated with `evidence_gap=True` without aborting the entire run.
-
-2. **Global Token-Bucket Rate Limiter**:
-   - Shared `AsyncSlidingWindowLimiter` paces Gemini LLM requests (`LLM_RPM`) and MCP searches (`SEARCH_RPM`).
-   - Prevents 429/ResourceExhausted quota exhaustion under high concurrency.
-   - Tenacity retries respect `Retry-After` headers and `retryDelay` payloads.
-   - Daily quota cap (`LLM_RPD`) triggers clean escalation instead of unhandled crashes.
-
-3. **Restricted Engine Search & Relevance Prefilter**:
-   - Provider hierarchy: Tavily (if configured) $\to$ Brave (if configured) $\to$ DuckDuckGo (DDGS). If an API key succeeds, DDGS is never called.
-   - DDGS is restricted via `DDGS_BACKENDS` (default `duckduckgo,wikipedia`) instead of fanning out to 7 engines simultaneously, eliminating 429/202 delays.
-   - Fast failures on 429/202 return status `"rate_limited"` immediately.
-   - A keyword-overlap and non-English/spam prefilter discards irrelevant, gaming, or emulator results before evidence collection.
-
-4. **Persistent SQLite Search Cache**:
-   - Normalizes queries (lowercasing, stop-word removal, sorted tokens) + max_results + provider.
-   - Cache hits cost **zero** search budget and return in $<1$ ms.
-   - Errors, rate-limited responses, and timeouts are never cached; empty results expire in 10 minutes.
-   - Concurrency safe using SQLite WAL mode and worker threads.
-
-5. **Cheaper, Smarter Critic**:
-   - Runs deterministic audit checks first. If a hard-fail condition is certain (e.g. `citation_validity < 1.0` or `evidence_gap_rate > 0.34`), the LLM judge is skipped entirely, saving latency and quota.
-   - When the judge runs, rationales are capped to $\le 2$ sentences per dimension.
-
-6. **Parallel Section Synthesis**:
-   - Detailed findings sections for each subtask are synthesized in parallel via `asyncio.gather`.
-   - One short final merge call produces the Title and Executive Summary.
-   - Top 4 sources per subtask with 300-char snippets cut prompt token volume by $>60\%$.
-
-7. **Live Observability (UI & API)**:
-   - Streamlit dashboard uses `st.status(...)` updated live via `graph.astream(stream_mode="updates")` showing active node, subtasks, searches, cache hits, and elapsed time.
-   - Per-node timing breakdowns are rendered in an expandable dashboard panel.
-   - FastAPI `/research/{task_id}/status` exposes real-time `current_node`, `elapsed_seconds`, `searches_performed`, and `cache_hits`.
-
----
-
-## Installation & Running
+To verify your live API key, model streaming, and structured output capabilities before running runs:
 
 ```bash
-pip install -r requirements.txt
+python scripts/smoke_llm.py
 ```
 
-### Download RAG Embedding Model Explicitly
+### Example Expected Output
 
-Research runs strictly forbid implicit or unexpected network model downloads. Download the local ONNX embedding weights explicitly before starting runs:
+```text
+==================================================================
+Research Agent Crew - Live LLM Verification & Smoke Test
+Provider:  GROQ
+Model:     <model-name>
+API Key:   gsk_...9a12 (56 chars)
+==================================================================
 
-```bash
-python -m core.rag.download_model
+--- 1. Testing Live Streaming & Token Delivery ---
+Antigravity is online.
+Time to First Token (TTFT): 142.3ms | Total Duration: 0.28s
+Full response received (22 chars): Antigravity is online.
+
+--- 2. Probing Structured Output Capability ---
+Testing mode 'function_calling'... PASS (180ms) -> status='ok' message='System fully operational' verified=True
+Testing mode 'json_mode'... PASS (195ms) -> status='ok' message='System fully operational' verified=True
+Testing mode 'json_schema'... FAIL (400 Bad Request: model does not support schema enforcement)
+
+[RECOMMENDATION] Set GROQ_STRUCTURED_MODE=function_calling for optimal reliability.
+
+==================================================================
+ALL CHECKS PASSED: Provider and model are operational for production.
+==================================================================
 ```
+
+---
+
+## RAG Embedding & Score Calibration
+
+1. **Download Local Embedding Model**:
+   ```bash
+   python -m core.rag.download_model
+   ```
+
+2. **Calibrate Grounding Thresholds (100% Offline)**:
+   ```bash
+   python scripts/calibrate_scores.py
+   ```
+   Evaluates cosine similarity percentiles (p10, p50, p95) on calibration sample pairs and prints recommended `RAG_MIN_SCORE` and `CHAT_MIN_SCORE` values.
+
+---
+
+## Launching Applications
 
 ### Launch FastAPI Service
-
 ```bash
 python -m uvicorn api.app:app --host 0.0.0.0 --port 8000
 ```
 
 ### Launch Streamlit Observability Dashboard
-
 ```bash
 python -m streamlit run ui/streamlit_app.py
 ```
 
-### Run Test Suite
+---
 
+## Testing Modes
+
+The test suite is structured into three execution modes to balance feedback speed with thoroughness:
+
+### 1. Fast Mode (`pytest -m "not slow"`)
+- **Target**: Fast local feedback loop (< 20s).
+- **Execution time**: ~19s (137 tests).
+- **Scope**: Core unit tests, in-memory state, deterministic ratelimit counters, schema migrations, and prompt routing.
 ```bash
-python -m pytest
+python -m pytest -m "not slow" -q --durations=10
 ```
 
-### Run Resilience & Completion Demo
-
+### 2. Pre-commit Mode (`pytest -m "not slow or critical"`)
+- **Target**: Pre-commit CI validation of all system invariants (< 30s).
+- **Execution time**: ~28s (143 tests).
+- **Scope**: All fast tests PLUS critical invariant verification:
+  - Search budget hard ceilings under parallelism
+  - Concurrent rate limiter & token reservation safety
+  - Mid-stream disconnect & node crash event persistence
+  - Missing-model fail-fast configuration enforcement
+  - Citation validation & hallucination prevention
+  - Offline network guard enforcement (blocking non-loopback calls)
+  - Cross-process database-backed chat lock acquisition & stale takeover
 ```bash
-python docs/demo_resumable_run.py
+python -m pytest -m "not slow or critical" -q --durations=10
 ```
 
-> **Note**: `docs/demo_resumable_run.py` executes 100% offline using deterministic test doubles (`StubLLM`, `PassingCriticLLM`, and mock MCP search tool). It does not require a live Gemini API key or consume external quota.
+### 3. Full Suite (`pytest`)
+- **Target**: Comprehensive end-to-end integration and resilience testing.
+- **Execution time**: ~105s (171 tests).
+- **Scope**: All 171 tests, including multi-process worker crashes and resume recovery (`test_real_subprocess_kill_and_resumption`), cross-process SQLite database tailing (`test_cross_process_db_tailing_without_gaps_or_duplicates`), live SSE streaming subscriptions, and real embedding model verification.
+```bash
+python -m pytest -q --durations=10
+```
 
+---
+
+## Migration Notes
+
+- **Quota Tracking Upgrade**: Migration to schema version 2 in `.cache/quota.db` introduces `llm_call_events` for token and request tracking while maintaining 100% backward compatibility with legacy `model_daily_quota` tables.
+- **Provider Switching**: Set `LLM_PROVIDER=groq` or `LLM_PROVIDER=gemini`. Existing runs, checkpointer state, and threads seamlessly resume under either provider.

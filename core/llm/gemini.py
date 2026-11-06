@@ -1,142 +1,32 @@
-"""LLM Provider and structured reasoning engine for Research Agent Crew.
+"""Google Gemini provider implementation for Research Agent Crew."""
 
-Provides production integration for Google Gemini with structured outputs,
-explicit configuration enforcement, retry policies with exponential backoff,
-and dependency injection for testing.
-"""
 import os
-import re
 import time
-from typing import Optional, List, Dict, Any, Tuple
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_exponential,
-    retry_if_exception,
-)
-from tenacity.wait import wait_base
+import asyncio
+from typing import Optional, List, Dict, Any, Tuple, AsyncIterator
 
-from core.state import (
-    ResearchPlan, CriticEvaluation, SubtaskResult, StructuredReport
-)
+from core.state import ResearchPlan, CriticEvaluation, SubtaskResult, StructuredReport
 from core.report_render import validate_structured_report, render_structured_report_to_markdown
 from core.timing import record_llm_call_timing
-from core.ratelimit import get_llm_rate_limiter, QuotaExceededError, get_daily_quota_tracker
-
-
-class ConfigurationError(RuntimeError):
-    """Raised when required environment configuration or API keys are missing."""
-    pass
-
-
-def _is_transient_error(exc: BaseException) -> bool:
-    """Detect transient 429 / rate limit / network / server errors.
-
-    Returns False for QuotaExceededError or long-delay daily quota 429s (> 60s).
-    """
-    if isinstance(exc, QuotaExceededError):
-        return False
-
-    delay = _extract_retry_after(exc)
-    if delay is not None and delay > 60.0:
-        return False
-
-    msg = str(exc).lower()
-    if "per day" in msg or "daily" in msg and "quota" in msg:
-        return False
-
-    transient_indicators = [
-        "429", "rate limit", "resource_exhausted", "resourceexhausted",
-        "quota", "503", "500", "overloaded", "temporary", "timeout",
-        "connection reset", "econnreset", "try again"
-    ]
-    return any(indicator in msg for indicator in transient_indicators)
-
-
-def _extract_retry_after(exc: BaseException) -> Optional[float]:
-    """Extract retry-after or retryDelay seconds from error if present."""
-    msg = str(exc)
-    response = getattr(exc, "response", None)
-    if response and hasattr(response, "headers"):
-        retry_header = response.headers.get("retry-after")
-        if retry_header and retry_header.isdigit():
-            return float(retry_header)
-
-    m = re.search(r"retry[-_]?after[:=\s]+(\d+(?:\.\d+)?)", msg, re.IGNORECASE)
-    if m:
-        return float(m.group(1))
-
-    m2 = re.search(r"retryDelay['\":\s]+(\d+(?:\.\d+)?)s?", msg, re.IGNORECASE)
-    if m2:
-        return float(m2.group(1))
-
-    m3 = re.search(r"retry in (\d+(?:\.\d+)?)s", msg, re.IGNORECASE)
-    if m3:
-        return float(m3.group(1))
-
-    return None
-
-
-class wait_with_retry_after(wait_base):
-    """Tenacity wait strategy that respects Retry-After with fallback to exponential backoff."""
-    def __init__(self, fallback_strategy, max_retry_after: float = 30.0):
-        self.fallback = fallback_strategy
-        self.max_retry_after = max_retry_after
-
-    def __call__(self, retry_state):
-        if retry_state.outcome and retry_state.outcome.failed:
-            exc = retry_state.outcome.exception()
-            delay = _extract_retry_after(exc)
-            if delay is not None and delay > 0:
-                return min(delay, self.max_retry_after)
-        return self.fallback(retry_state)
-
-
-llm_retry = retry(
-    reraise=True,
-    stop=stop_after_attempt(4),
-    wait=wait_with_retry_after(wait_exponential(multiplier=1, min=2, max=10)),
-    retry=retry_if_exception(_is_transient_error)
+from core.ratelimit import (
+    get_llm_rate_limiter,
+    get_daily_quota_tracker,
+    QuotaExceededError,
+    ConfigurationError
 )
-
-
-class BaseAgentLLM:
-    """Interface for agent LLM reasoning."""
-
-    async def generate_plan(
-        self,
-        task: str,
-        critic_evaluation: Optional[CriticEvaluation] = None,
-        iteration: int = 0,
-        subtask_results: Optional[List[SubtaskResult]] = None
-    ) -> ResearchPlan:
-        raise NotImplementedError
-
-    async def synthesize_findings(
-        self,
-        task: str,
-        plan: ResearchPlan,
-        subtask_results: List[SubtaskResult],
-        critic_evaluation: Optional[CriticEvaluation] = None,
-        iteration: int = 0
-    ) -> Any:
-        raise NotImplementedError
-
-    async def evaluate_report(
-        self,
-        task: str,
-        plan: ResearchPlan,
-        report: str,
-        subtask_results: List[SubtaskResult],
-        iteration: int = 0,
-        deterministic_metrics: Optional[Dict[str, Any]] = None,
-        structured_report: Optional[StructuredReport] = None
-    ) -> CriticEvaluation:
-        raise NotImplementedError
+from core.llm.base import (
+    BaseAgentLLM,
+    llm_retry,
+    estimate_tokens,
+    strip_reasoning_tags,
+    _extract_retry_after,
+    _is_transient_error
+)
+from core.llm.context import get_role_max_tokens
 
 
 class GeminiAgentLLM(BaseAgentLLM):
-    """Production LLM using Google Gemini with structured outputs."""
+    """Production LLM using Google Gemini with structured outputs and token reservations."""
 
     def __init__(
         self,
@@ -164,6 +54,7 @@ class GeminiAgentLLM(BaseAgentLLM):
 
         self.model_name = resolved_model
         self.temperature = temperature
+        self.provider = "gemini"
         self.llm = ChatGoogleGenerativeAI(
             model=self.model_name,
             google_api_key=self.api_key,
@@ -171,49 +62,225 @@ class GeminiAgentLLM(BaseAgentLLM):
             max_retries=0
         )
 
-    async def _invoke_structured(self, schema_cls: Any, prompt: str) -> Any:
-        """Invoke LLM with structured output, handling parsing_error with single retry."""
-        structured_llm = self.llm.with_structured_output(schema_cls, include_raw=True)
+    async def _invoke_structured(
+        self,
+        schema_cls: Any,
+        prompt: str,
+        role: str = "agent"
+    ) -> Any:
+        """Invoke LLM with structured output, length check, and repair prompt retry."""
+        limiter = get_llm_rate_limiter()
+        max_output_tokens = get_role_max_tokens(role)
+        estimated_input = estimate_tokens(prompt)
+        
+        async def _execute_attempt(prompt_text: str, budget_tokens: int) -> Tuple[Any, Optional[str], int]:
+            # Acquire reservation handle in SQLite
+            reservation = await limiter.acquire_reservation(
+                provider=self.provider,
+                model=self.model_name,
+                estimated_tokens=estimated_input + budget_tokens
+            )
 
-        @llm_retry
-        async def _call_once():
-            # Acquire slot and count attempt against persistent daily quota counter
-            await get_llm_rate_limiter().acquire(model=self.model_name)
-            try:
-                return await structured_llm.ainvoke(prompt)
-            except Exception as exc:
-                delay = _extract_retry_after(exc)
-                msg = str(exc).lower()
-                is_daily_mention = "per day" in msg or "daily" in msg and "quota" in msg
-                is_quota_429 = ("429" in msg or "resource_exhausted" in msg or "quota" in msg) and (
-                    (delay is not None and delay > 60.0) or is_daily_mention
+            async with reservation:
+                call_llm = self.llm
+                if hasattr(call_llm, "max_output_tokens"):
+                    call_llm.max_output_tokens = budget_tokens
+
+                structured_llm = call_llm.with_structured_output(schema_cls, include_raw=True)
+
+                @llm_retry
+                async def _call():
+                    try:
+                        return await structured_llm.ainvoke(prompt_text)
+                    except Exception as exc:
+                        delay = _extract_retry_after(exc)
+                        msg = str(exc).lower()
+                        is_daily_mention = "per day" in msg or ("daily" in msg and "quota" in msg)
+                        is_quota_429 = ("429" in msg or "resource_exhausted" in msg or "quota" in msg) and (
+                            (delay is not None and delay > 60.0) or is_daily_mention
+                        )
+                        if is_quota_429:
+                            tracker = get_daily_quota_tracker()
+                            tracker.set_quota_exhausted(self.model_name)
+                            reset_time_str = tracker.get_reset_time_description("pacific_midnight")
+                            raise QuotaExceededError(
+                                f"Google Gemini daily quota exceeded for model '{self.model_name}' (retry delay: {delay if delay is not None else 'N/A'}). {reset_time_str}.",
+                                reset_time=reset_time_str
+                            ) from exc
+                        raise
+
+                result_dict = await _call()
+
+                # Extract tokens and finish reason
+                raw_msg = result_dict.get("raw") if isinstance(result_dict, dict) else None
+                finish_reason = None
+                actual_tokens = 0
+                if raw_msg is not None:
+                    resp_meta = getattr(raw_msg, "response_metadata", {}) or {}
+                    addl_kwargs = getattr(raw_msg, "additional_kwargs", {}) or {}
+                    finish_reason = resp_meta.get("finish_reason") or addl_kwargs.get("finish_reason")
+                    usage = getattr(raw_msg, "usage_metadata", None) or resp_meta.get("usage_metadata")
+                    if usage and isinstance(usage, dict):
+                        actual_tokens = usage.get("total_tokens") or (usage.get("input_tokens", 0) + usage.get("output_tokens", 0))
+
+                if actual_tokens <= 0:
+                    raw_text = str(getattr(raw_msg, "content", ""))
+                    _, think_tokens = strip_reasoning_tags(raw_text)
+                    actual_tokens = estimated_input + estimate_tokens(raw_text) + think_tokens
+
+                reservation.set_actual_tokens(actual_tokens)
+                return result_dict, finish_reason, actual_tokens
+
+        # Attempt 1
+        current_budget = max_output_tokens
+        result_dict, finish_reason, _ = await _execute_attempt(prompt, current_budget)
+
+        # Handle finish_reason == 'length' with single budget retry
+        if finish_reason in ("length", "max_tokens"):
+            new_budget = min(current_budget * 2, 8192)
+            if new_budget > current_budget:
+                result_dict, finish_reason, _ = await _execute_attempt(prompt, new_budget)
+            if finish_reason in ("length", "max_tokens"):
+                raise RuntimeError(
+                    f"Model output truncated due to max output tokens limit ({current_budget}). "
+                    f"Increase {role.upper()}_MAX_TOKENS or verify context settings."
                 )
-                if is_quota_429:
-                    tracker = get_daily_quota_tracker()
-                    tracker.set_quota_exhausted(self.model_name)
-                    reset_time_str = tracker.get_reset_time_description()
-                    raise QuotaExceededError(
-                        f"Google Gemini daily quota exceeded for model '{self.model_name}' (retry delay: {delay if delay is not None else 'N/A'}). {reset_time_str}.",
-                        reset_time=reset_time_str
-                    ) from exc
-                raise
 
-        result_dict = await _call_once()
-
-        # Handle include_raw=True dict: {"raw": ..., "parsed": ..., "parsing_error": ...}
+        # Handle parsing or validation errors with single repair prompt retry
         if isinstance(result_dict, dict) and "parsed" in result_dict:
             parsing_err = result_dict.get("parsing_error")
             parsed_obj = result_dict.get("parsed")
+
             if parsing_err is not None or parsed_obj is None:
-                # Retry once as per specification
-                retry_dict = await _call_once()
+                repair_prompt = (
+                    f"The previous output failed validation with error: {parsing_err}.\n"
+                    f"Please correct the errors and return valid JSON adhering strictly to the schema.\n\n"
+                    f"Original Prompt:\n{prompt}"
+                )
+                retry_dict, _, _ = await _execute_attempt(repair_prompt, current_budget)
                 if retry_dict.get("parsing_error") is not None or retry_dict.get("parsed") is None:
                     raise ValueError(
-                        f"Structured output parsing failed after retry: {retry_dict.get('parsing_error')}"
+                        f"Structured output parsing failed after repair retry: {retry_dict.get('parsing_error')}"
                     )
                 return retry_dict["parsed"]
+
             return parsed_obj
+
         return result_dict
+
+    async def astream_chat(
+        self,
+        messages: List[Dict[str, str]],
+        model_name: Optional[str] = None
+    ) -> AsyncIterator[str]:
+        """Stream chat tokens, retrying only before the first token is received."""
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+
+        resolved_model = model_name or os.environ.get("CHAT_MODEL", self.model_name)
+        chat_llm = ChatGoogleGenerativeAI(
+            model=resolved_model,
+            google_api_key=self.api_key,
+            temperature=self.temperature,
+            max_retries=0
+        )
+
+        lc_messages = []
+        full_prompt_text = ""
+        for m in messages:
+            role = m.get("role", "user")
+            content = m.get("content", "")
+            full_prompt_text += f"\n{content}"
+            if role == "system":
+                lc_messages.append(SystemMessage(content=content))
+            elif role == "assistant":
+                lc_messages.append(AIMessage(content=content))
+            else:
+                lc_messages.append(HumanMessage(content=content))
+
+        max_output_tokens = get_role_max_tokens("chat")
+        estimated_input = estimate_tokens(full_prompt_text)
+        limiter = get_llm_rate_limiter()
+
+        reservation = await limiter.acquire_reservation(
+            provider=self.provider,
+            model=resolved_model,
+            estimated_tokens=estimated_input + max_output_tokens
+        )
+
+        stream_iter = None
+        max_attempts = 3
+        first_chunk = None
+
+        # Retry only before the first token
+        for attempt in range(max_attempts):
+            try:
+                stream = chat_llm.astream(lc_messages)
+                stream_iter = stream.__aiter__()
+                first_chunk = await stream_iter.__anext__()
+                break
+            except StopAsyncIteration:
+                await reservation.complete(estimated_input)
+                return
+            except Exception as exc:
+                delay = _extract_retry_after(exc)
+                msg = str(exc).lower()
+                is_daily = "per day" in msg or ("daily" in msg and "quota" in msg)
+                is_quota_429 = ("429" in msg or "resource_exhausted" in msg or "quota" in msg) and (
+                    (delay is not None and delay > 60.0) or is_daily
+                )
+                if is_quota_429:
+                    await reservation.mark_ambiguous("quota_exceeded")
+                    tracker = get_daily_quota_tracker()
+                    tracker.set_quota_exhausted(resolved_model)
+                    reset_time_str = tracker.get_reset_time_description("pacific_midnight")
+                    raise QuotaExceededError(
+                        f"Google Gemini daily quota exceeded for model '{resolved_model}'. {reset_time_str}.",
+                        reset_time=reset_time_str
+                    ) from exc
+
+                if attempt < max_attempts - 1 and _is_transient_error(exc):
+                    await asyncio.sleep(min(delay or (2 ** attempt), 10.0))
+                    continue
+
+                await reservation.mark_ambiguous(type(exc).__name__)
+                raise
+
+        emitted_chars = 0
+        actual_tokens_from_metadata = None
+
+        try:
+            if first_chunk:
+                content = str(getattr(first_chunk, "content", ""))
+                clean, _ = strip_reasoning_tags(content)
+                if clean:
+                    emitted_chars += len(clean)
+                    yield clean
+                usage = getattr(first_chunk, "usage_metadata", None)
+                if usage and isinstance(usage, dict):
+                    actual_tokens_from_metadata = usage.get("total_tokens")
+
+            async for chunk in stream_iter:
+                if chunk:
+                    content = str(getattr(chunk, "content", ""))
+                    clean, _ = strip_reasoning_tags(content)
+                    if clean:
+                        emitted_chars += len(clean)
+                        yield clean
+                    usage = getattr(chunk, "usage_metadata", None)
+                    if usage and isinstance(usage, dict):
+                        actual_tokens_from_metadata = usage.get("total_tokens")
+
+            final_tokens = (
+                actual_tokens_from_metadata
+                if actual_tokens_from_metadata is not None
+                else (estimated_input + max(1, emitted_chars // 4))
+            )
+            await reservation.complete(final_tokens)
+
+        except Exception as exc:
+            await reservation.mark_ambiguous(type(exc).__name__)
+            raise
 
     async def generate_plan(
         self,
@@ -259,7 +326,7 @@ Produce focused subtasks ONLY for identified gaps. Do not repeat already-satisfi
 Explain your changes in the revision_notes field.
 """
         t0 = time.perf_counter()
-        plan = await self._invoke_structured(ResearchPlan, prompt)
+        plan = await self._invoke_structured(ResearchPlan, prompt, role="planner")
         record_llm_call_timing("generate_plan", self.model_name, (time.perf_counter() - t0) * 1000.0)
         return plan
 
@@ -290,9 +357,9 @@ Explain your changes in the revision_notes field.
 
         def sanitize_evidence_text(raw_text: str) -> str:
             """Neutralize/escape XML-like evidence tags to prevent prompt injection."""
+            import re
             return re.sub(r"</?evidence_chunk[^>]*>", "[neutralized-chunk-tag]", raw_text)
 
-        # Build evidence text respecting RAG_MAX_CONTEXT_CHARS and subtask shares
         evidence_blocks = []
         num_subtasks = max(1, len(subtask_results))
         per_subtask_char_budget = max(500, max_context_chars // num_subtasks)
@@ -304,7 +371,6 @@ Explain your changes in the revision_notes field.
             retrieved_chunks = getattr(r, "retrieved_chunks", [])
 
             if retrieved_chunks:
-                # Sort chunks by relevance score descending
                 sorted_chunks = sorted(retrieved_chunks, key=lambda c: getattr(c, "score", 0.0), reverse=True)
                 for chunk in sorted_chunks:
                     clean_chunk_text = sanitize_evidence_text(chunk.text or "")
@@ -324,7 +390,6 @@ Explain your changes in the revision_notes field.
                     subtask_evidence_pieces.append(wrapped)
                     subtask_char_count += piece_len
 
-            # Fallback to source snippets if no RAG chunks were available
             if not subtask_evidence_pieces and r.sources:
                 top_sources = r.sources[:max_sources]
                 for s in top_sources:
@@ -378,7 +443,7 @@ CRITICAL INSTRUCTIONS:
 5. Executive Takeaways: `tldr` must contain at most 5 concise, high-impact takeaway bullet points.
 6. Provide accurate confidence scores (0.0 to 1.0) for each claim based on source authority and clarity.
 """
-        raw_structured: StructuredReport = await self._invoke_structured(StructuredReport, synth_prompt)
+        raw_structured: StructuredReport = await self._invoke_structured(StructuredReport, synth_prompt, role="synth")
 
         all_retrieved_sources = [s for r in subtask_results for s in r.sources]
         all_retrieved_chunks = [c for r in subtask_results for c in getattr(r, "retrieved_chunks", [])]
@@ -398,7 +463,6 @@ CRITICAL INSTRUCTIONS:
         deterministic_metrics: Optional[Dict[str, Any]] = None,
         structured_report: Optional[StructuredReport] = None
     ) -> CriticEvaluation:
-        # LLM judge prompt for Part B
         metrics_summary = ""
         if deterministic_metrics:
             claim_info = ""
@@ -465,117 +529,10 @@ Provide concise justifications (at most 2 sentences per dimension) along with th
 If any score is below 4, provide 2 to 3 actionable next_step_instructions specifying exactly what evidence or subtasks must be addressed.
 """
         t0 = time.perf_counter()
-        evaluation = await self._invoke_structured(CriticEvaluation, prompt)
+        evaluation = await self._invoke_structured(CriticEvaluation, prompt, role="critic")
         record_llm_call_timing("evaluate_report", self.model_name, (time.perf_counter() - t0) * 1000.0)
         evaluation.iteration = iteration
         evaluation.total_score = (
             evaluation.coverage.score + evaluation.evidence.score + evaluation.coherence.score
         )
         return evaluation
-
-
-# Global injectable override for test suites
-_GLOBAL_LLM_OVERRIDE: Optional[BaseAgentLLM] = None
-
-
-def set_global_llm(llm: Optional[BaseAgentLLM]) -> None:
-    """Inject an LLM instance (such as StubLLM in test suites)."""
-    global _GLOBAL_LLM_OVERRIDE
-    _GLOBAL_LLM_OVERRIDE = llm
-
-
-def resolve_model_name(role_env_var: str, explicit_override: Optional[str] = None) -> str:
-    """Resolve model name for a specific agent role following priority:
-    1. Explicit runtime override (if provided)
-    2. Role-specific env var (PLANNER_MODEL, SYNTH_MODEL, CRITIC_MODEL)
-    3. Global GEMINI_MODEL
-    """
-    if explicit_override and explicit_override.strip():
-        return explicit_override.strip()
-
-    role_model = os.environ.get(role_env_var, "").strip()
-    if role_model:
-        return role_model
-
-    gemini_model = os.environ.get("GEMINI_MODEL", "").strip()
-    if not gemini_model:
-        raise ConfigurationError(
-            f"GEMINI_MODEL environment variable is not set. Please set GEMINI_MODEL (or {role_env_var}) in your environment or .env file."
-        )
-    return gemini_model
-
-
-def get_planner_llm(model_name: Optional[str] = None) -> BaseAgentLLM:
-    """Factory to acquire the Planner agent LLM (PLANNER_MODEL or GEMINI_MODEL)."""
-    if _GLOBAL_LLM_OVERRIDE is not None:
-        return _GLOBAL_LLM_OVERRIDE
-
-    target_model = resolve_model_name("PLANNER_MODEL", model_name)
-    gemini_key = (
-        os.environ.get("GEMINI_API_KEY", "").strip()
-        or os.environ.get("GOOGLE_API_KEY", "").strip()
-    )
-    if not gemini_key:
-        raise ConfigurationError(
-            "GEMINI_API_KEY is required. Please set GEMINI_API_KEY (or GOOGLE_API_KEY) in your environment or .env file."
-        )
-
-    return GeminiAgentLLM(model_name=target_model, api_key=gemini_key, temperature=0.2)
-
-
-def get_synth_llm(model_name: Optional[str] = None) -> BaseAgentLLM:
-    """Factory to acquire the Synthesizer agent LLM (SYNTH_MODEL or GEMINI_MODEL)."""
-    if _GLOBAL_LLM_OVERRIDE is not None:
-        return _GLOBAL_LLM_OVERRIDE
-
-    target_model = resolve_model_name("SYNTH_MODEL", model_name)
-    gemini_key = (
-        os.environ.get("GEMINI_API_KEY", "").strip()
-        or os.environ.get("GOOGLE_API_KEY", "").strip()
-    )
-    if not gemini_key:
-        raise ConfigurationError(
-            "GEMINI_API_KEY is required. Please set GEMINI_API_KEY (or GOOGLE_API_KEY) in your environment or .env file."
-        )
-
-    return GeminiAgentLLM(model_name=target_model, api_key=gemini_key, temperature=0.2)
-
-
-def get_agent_llm(model_name: Optional[str] = None) -> BaseAgentLLM:
-    """Factory to acquire the primary agent LLM.
-
-    Returns the Gemini implementation or raises ConfigurationError if keys or model are missing.
-    Can be overridden via set_global_llm for testing.
-    """
-    if _GLOBAL_LLM_OVERRIDE is not None:
-        return _GLOBAL_LLM_OVERRIDE
-
-    target_model = resolve_model_name("GEMINI_MODEL", model_name)
-    gemini_key = (
-        os.environ.get("GEMINI_API_KEY", "").strip()
-        or os.environ.get("GOOGLE_API_KEY", "").strip()
-    )
-    if not gemini_key:
-        raise ConfigurationError(
-            "GEMINI_API_KEY is required. Please set GEMINI_API_KEY (or GOOGLE_API_KEY) in your environment or .env file."
-        )
-
-    return GeminiAgentLLM(model_name=target_model, api_key=gemini_key, temperature=0.2)
-
-
-def get_critic_llm(model_name: Optional[str] = None) -> BaseAgentLLM:
-    """Factory to acquire the Critic LLM judge (CRITIC_MODEL or GEMINI_MODEL, temperature 0.0)."""
-    if _GLOBAL_LLM_OVERRIDE is not None:
-        return _GLOBAL_LLM_OVERRIDE
-
-    target_model = resolve_model_name("CRITIC_MODEL", model_name)
-    gemini_key = (
-        os.environ.get("GEMINI_API_KEY", "").strip()
-        or os.environ.get("GOOGLE_API_KEY", "").strip()
-    )
-    if not gemini_key:
-        raise ConfigurationError(
-            "GEMINI_API_KEY is required. Please set GEMINI_API_KEY (or GOOGLE_API_KEY) in your environment or .env file."
-        )
-
-    return GeminiAgentLLM(model_name=target_model, api_key=gemini_key, temperature=0.0)

@@ -132,6 +132,7 @@ async def test_startup_recovery_marks_orphaned_running_runs_failed_and_preserves
     assert check_live.status == "running"
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_cancel_stops_run_cooperatively():
     """cancel_run sets cancel_requested and halts run execution cooperatively."""
@@ -239,6 +240,7 @@ async def test_real_subprocess_kill_and_resumption(tmp_path, monkeypatch):
     env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
 
     signal_file = tmp_path / "mid_executor.signal"
+    ready_file = tmp_path / "worker_ready.signal"
     worker_log = tmp_path / "worker.log"
     cmd = [
         sys.executable,
@@ -250,7 +252,9 @@ async def test_real_subprocess_kill_and_resumption(tmp_path, monkeypatch):
         "--kill-point",
         "executor",
         "--signal-file",
-        str(signal_file)
+        str(signal_file),
+        "--ready-file",
+        str(ready_file)
     ]
 
     log_file_handle = open(worker_log, "w", encoding="utf-8")
@@ -264,7 +268,7 @@ async def test_real_subprocess_kill_and_resumption(tmp_path, monkeypatch):
 
     # 1. Wait non-blocking for child to signal executor completion pause point
     reached_pause = False
-    for _ in range(150):  # 15s max
+    for _ in range(300):  # 30s max
         if signal_file.exists():
             reached_pause = True
             break

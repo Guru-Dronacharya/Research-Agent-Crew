@@ -164,3 +164,36 @@ class DocumentResponse(BaseModel):
     run_id: Optional[str] = None
     meta: Dict[str, Any] = Field(default_factory=dict)
     is_duplicate: bool = False
+
+# ==============================================================================
+# Thread Chat & Router Schemas
+# ==============================================================================
+
+class ChatRequest(BaseModel):
+    """Payload for streaming chat over a thread's knowledge."""
+    message: str = Field(..., min_length=1, description="User question or prompt")
+    allow_general_knowledge: Optional[bool] = Field(
+        default=None,
+        description="Explicit toggle allowing answers from model memory when thread sources are missing"
+    )
+    mode: str = Field(
+        default="auto",
+        description="Routing mode override: 'auto', 'thread', 'quick', or 'research'"
+    )
+
+
+class RouterClassifyRequest(BaseModel):
+    """Payload to classify a query using zero-LLM heuristics."""
+    query: Optional[str] = Field(default=None, description="User question or search query")
+    message: Optional[str] = Field(default=None, description="User question or search query (alias for query)")
+
+    @property
+    def text(self) -> str:
+        return (self.query or self.message or "").strip()
+
+
+class RouterClassifyResponse(BaseModel):
+    """Heuristic router classification response."""
+    mode: str = Field(..., description="Chosen mode: 'canned', 'thread', 'quick', or 'research'")
+    reason: str = Field(..., description="Explanation of heuristic routing decision")
+    canned_response: Optional[str] = Field(default=None, description="Direct canned reply if greeting/thanks")

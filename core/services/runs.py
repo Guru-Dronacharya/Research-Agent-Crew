@@ -21,6 +21,7 @@ from core.db.repositories import (
 from core.checkpoint import get_checkpointer
 from core.graph import build_research_graph, create_initial_state
 from core.ratelimit import QuotaExceededError, get_daily_quota_tracker
+from core.llm import get_provider, resolve_model_name
 from core.cancellation import (
     is_cancellation_requested,
     request_cancellation_in_process,
@@ -185,6 +186,17 @@ async def execute_run(
             if await is_cancellation_requested(run.id, db_path=db_path):
                 raise RunCancelledError(f"Run '{run.id}' was cancelled before starting.")
 
+            try:
+                provider = get_provider()
+            except Exception:
+                provider = "gemini"
+
+            cfg = run.config or {}
+            try:
+                model_name = cfg.get("model_name") or resolve_model_name("PLANNER_MODEL")
+            except Exception:
+                model_name = cfg.get("model_name") or ""
+
             if is_resume:
                 try:
                     await graph.aupdate_state(graph_config, {"is_resume": True})
@@ -192,10 +204,8 @@ async def execute_run(
                     pass
                 input_state = None
             else:
-                cfg = run.config or {}
                 max_retries = int(cfg.get("max_retries", 1))
                 search_budget = int(cfg.get("search_budget", 10))
-                model_name = cfg.get("model_name") or os.environ.get("GEMINI_MODEL", "")
                 input_state = create_initial_state(
                     task=run.task,
                     max_retries=max_retries,
@@ -223,6 +233,8 @@ async def execute_run(
             )
 
             metrics = {
+                "provider": provider,
+                "model": model_name,
                 "searches_performed": final_state.get("total_searches_performed", 0),
                 "cache_hits": final_state.get("cache_hits", 0),
                 "retries": final_state.get("retry_count", 0),

@@ -1,3 +1,4 @@
+from core.llm import get_provider, resolve_model_name, validate_config
 """Streamlit Observability Dashboard for Research Agent Crew.
 
 Provides an interactive user interface to manage persistent research threads,
@@ -11,6 +12,7 @@ import json
 import time
 import asyncio
 import threading
+import queue
 from pathlib import Path
 
 # Add project root to path
@@ -121,6 +123,32 @@ class AsyncBackgroundRunner:
         future = self.submit(coro)
         return future.result(timeout=timeout)
 
+    def stream_chat_to_queue(
+        self,
+        thread_id: str,
+        message: str,
+        allow_general_knowledge: bool,
+        mode: str,
+        out_q: queue.Queue
+    ):
+        """Bridge async stream_thread_chat on background loop to a synchronous thread-safe queue."""
+        async def _run():
+            try:
+                from core.chat import stream_thread_chat
+                async for event in stream_thread_chat(
+                    thread_id=thread_id,
+                    message=message,
+                    allow_general_knowledge=allow_general_knowledge,
+                    mode=mode
+                ):
+                    out_q.put(event)
+            except Exception as exc:
+                out_q.put(exc)
+            finally:
+                out_q.put(None)
+
+        asyncio.run_coroutine_threadsafe(_run(), self.loop)
+
 
 @st.cache_resource
 def get_async_runner() -> AsyncBackgroundRunner:
@@ -135,9 +163,17 @@ event_repo = EventRepo()
 msg_repo = MessageRepo()
 
 # Developer Configuration
-gemini_key = os.environ.get("GEMINI_API_KEY", "").strip() or os.environ.get("GOOGLE_API_KEY", "").strip()
-env_model = os.environ.get("GEMINI_MODEL", "").strip()
-chosen_model = env_model or "gemini-2.0-flash"
+provider = get_provider()
+try:
+    validate_config()
+    is_configured = True
+    config_error_msg = ""
+    chosen_model = resolve_model_name("PLANNER_MODEL")
+except Exception as cfg_err:
+    is_configured = False
+    config_error_msg = str(cfg_err)
+    chosen_model = "unconfigured"
+
 try:
     max_retries = int(os.environ.get("MAX_RETRIES", "1"))
 except ValueError:
@@ -146,8 +182,6 @@ try:
     search_budget = int(os.environ.get("SEARCH_BUDGET", "10"))
 except ValueError:
     search_budget = 10
-
-is_configured = bool(gemini_key and chosen_model)
 
 # Session State Initialization
 if "active_thread_id" not in st.session_state:
@@ -248,10 +282,10 @@ if not active_thread:
     st.stop()
 
 st.title(f"🔍 {active_thread.title}")
-st.caption(f"Thread ID: `{active_thread.id}` | Created: {active_thread.created_at[:19]}")
+st.caption(f"Thread ID: `{active_thread.id}` | Created: {active_thread.created_at[:19]} | Provider: **{provider.upper()}** (`{chosen_model}`)")
 
 if not is_configured:
-    st.error("⚠️ **Configuration Incomplete**: `GEMINI_API_KEY` (and `GEMINI_MODEL`) must be configured in your environment or `.env` file.")
+    st.error(f"⚠️ **Configuration Incomplete**: {config_error_msg}")
 
 # Fetch thread history and runs from SQLite
 runs = runner.run_sync(run_repo.list_runs_by_thread(active_thread.id))
@@ -409,7 +443,7 @@ with st.form("research_form"):
 
 if submit_btn and user_query.strip():
     if not is_configured:
-        st.error("Cannot launch: GEMINI_API_KEY is missing.")
+        st.error(f"Cannot launch: {config_error_msg}")
         st.stop()
 
     cfg = {
@@ -434,38 +468,167 @@ if submit_btn and user_query.strip():
 
 
 # ==============================================================================
-# Results View: Latest Report & Observations
+# Results View: Latest Report & Observations & Thread Chat
 # ==============================================================================
-if latest_run and latest_run.report_md:
+st.markdown("---")
+
+struct = None
+if latest_run and latest_run.report_json:
+    try:
+        struct = json.loads(latest_run.report_json)
+    except Exception:
+        pass
+
+tab_chat, tab_report, tab_trace, tab_sources, tab_docs = st.tabs([
+    "💬 Thread Chat",
+    "📄 Final Research Report",
+    "🔍 Observability & Run Events",
+    "🌐 Discovered Citations",
+    "📁 Sources & Documents"
+])
+
+with tab_chat:
+    st.markdown(f"### 💬 Chat with Knowledge Base ({active_thread.title})")
+    
+    ctrl_col1, ctrl_col2 = st.columns([1, 2])
+    with ctrl_col1:
+        current_gk = active_thread.settings.get("allow_general_knowledge", False)
+        allow_gk = st.checkbox(
+            "🌐 Allow General Knowledge",
+            value=current_gk,
+            help="Permit answering from model memory when thread sources are missing",
+            key=f"gk_cb_{active_thread.id}"
+        )
+        if allow_gk != current_gk:
+            runner.run_sync(thread_repo.update_thread_settings(active_thread.id, {"allow_general_knowledge": allow_gk}))
+            active_thread.settings["allow_general_knowledge"] = allow_gk
+
+    with ctrl_col2:
+        mode_choice = st.radio(
+            "Routing Mode",
+            options=["Auto (Zero-LLM Router)", "Quick Answer (1 Search)", "Full Research Crew", "Thread Only"],
+            horizontal=True,
+            key=f"mode_sel_{active_thread.id}"
+        )
+        mode_map = {
+            "Auto (Zero-LLM Router)": "auto",
+            "Quick Answer (1 Search)": "quick",
+            "Full Research Crew": "research",
+            "Thread Only": "thread"
+        }
+        selected_mode = mode_map[mode_choice]
+
     st.markdown("---")
 
-    # High-level Metrics Row
-    m_col1, m_col2, m_col3, m_col4 = st.columns(4)
-    metrics_data = latest_run.metrics or {}
-    searches = metrics_data.get("searches_performed", 0)
-    cache_hits = metrics_data.get("cache_hits", 0)
-    retries = metrics_data.get("retries", 0)
+    # Load existing messages from database
+    msg_repo = MessageRepo()
+    thread_messages = runner.run_sync(msg_repo.list_messages(active_thread.id))
+    
+    for m in thread_messages:
+        with st.chat_message(m.role):
+            st.markdown(m.content)
+            if m.role == "assistant":
+                meta = m.metadata or {}
+                badges = []
+                if meta.get("general_knowledge_used"):
+                    badges.append(":orange[⚠️ General Knowledge (Not Grounded)]")
+                if meta.get("low_confidence"):
+                    badges.append(":red[⚠️ Low Confidence: sources not fully read]")
+                if meta.get("partial"):
+                    badges.append(f":red[⚠️ Interrupted: {meta.get('partial_reason', 'partial')}]")
+                req_cnt = meta.get("requests") or meta.get("gemini_requests")
+                prov = meta.get("provider", provider)
+                if req_cnt is not None:
+                    badges.append(f":blue[Requests: {req_cnt} ({prov})]")
+                if badges:
+                    st.caption(" • ".join(badges))
 
-    m_col1.metric("Run Status", latest_run.status.upper())
-    m_col2.metric("Reflection Loops", f"{retries} / {max_retries}")
-    m_col3.metric("MCP Searches", f"{searches} / {search_budget}")
-    m_col4.metric("Cache Hits", cache_hits)
+                citations = meta.get("citations", [])
+                if citations:
+                    with st.expander(f"📚 Citations ({len(citations)})", expanded=False):
+                        for cit in citations:
+                            c_id = cit.get("id", "")
+                            c_title = cit.get("title", c_id)
+                            c_url = cit.get("url", "")
+                            if c_url:
+                                st.markdown(f"- **`[{c_id}]`** [{c_title}]({c_url})")
+                            else:
+                                st.markdown(f"- **`[{c_id}]`** {c_title}")
 
-    struct = None
-    if latest_run.report_json:
-        try:
-            struct = json.loads(latest_run.report_json)
-        except Exception:
-            pass
+    # Chat input widget
+    is_streaming = st.session_state.get(f"streaming_{active_thread.id}", False)
+    user_prompt = st.chat_input("Ask a question about this thread's research or documents...", disabled=is_streaming)
+    
+    if user_prompt:
+        st.session_state[f"streaming_{active_thread.id}"] = True
+        with st.chat_message("user"):
+            st.markdown(user_prompt)
 
-    tab_report, tab_trace, tab_sources, tab_docs = st.tabs([
-        "📄 Final Research Report",
-        "🔍 Observability & Run Events",
-        "🌐 Discovered Citations",
-        "📁 Sources & Documents"
-    ])
+        with st.chat_message("assistant"):
+            out_q = queue.Queue()
+            runner.stream_chat_to_queue(
+                thread_id=active_thread.id,
+                message=user_prompt,
+                allow_general_knowledge=allow_gk,
+                mode=selected_mode,
+                out_q=out_q
+            )
 
-    with tab_report:
+            collected_citations = []
+            def _stream_gen():
+                while True:
+                    item = out_q.get()
+                    if item is None:
+                        break
+                    if isinstance(item, Exception):
+                        st.error(f"Chat error: {item}")
+                        break
+                    if hasattr(item, "event"):
+                        if item.event == "answer_delta":
+                            yield item.data.get("delta", "")
+                        elif item.event == "citation":
+                            collected_citations.extend(item.data.get("citations", []))
+                        elif item.event == "error":
+                            st.error(item.data.get("error", "Error occurred during chat"))
+                    elif isinstance(item, dict):
+                        if item.get("event") == "answer_delta":
+                            yield item.get("data", {}).get("delta", "")
+                        elif item.get("event") == "citation":
+                            collected_citations.extend(item.get("data", {}).get("citations", []))
+                        elif item.get("event") == "error":
+                            st.error(item.get("data", {}).get("error", "Error occurred during chat"))
+                    elif isinstance(item, str):
+                        yield item
+
+            st.write_stream(_stream_gen())
+
+            if collected_citations:
+                with st.expander(f"📚 Citations ({len(collected_citations)})", expanded=True):
+                    for cit in collected_citations:
+                        c_id = cit.get("id", "")
+                        c_title = cit.get("title", c_id)
+                        c_url = cit.get("url", "")
+                        if c_url:
+                            st.markdown(f"- **`[{c_id}]`** [{c_title}]({c_url})")
+                        else:
+                            st.markdown(f"- **`[{c_id}]`** {c_title}")
+
+        st.session_state[f"streaming_{active_thread.id}"] = False
+        st.rerun()
+
+with tab_report:
+    if latest_run and latest_run.report_md:
+        m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+        metrics_data = latest_run.metrics or {}
+        searches = metrics_data.get("searches_performed", 0)
+        cache_hits = metrics_data.get("cache_hits", 0)
+        retries = metrics_data.get("retries", 0)
+
+        m_col1.metric("Run Status", latest_run.status.upper())
+        m_col2.metric("Reflection Loops", f"{retries} / {max_retries}")
+        m_col3.metric("MCP Searches", f"{searches} / {search_budget}")
+        m_col4.metric("Cache Hits", cache_hits)
+
         if struct and isinstance(struct, dict):
             s_title = struct.get("title", active_thread.title)
             s_tldr = struct.get("tldr", [])
@@ -560,9 +723,14 @@ if latest_run and latest_run.report_md:
                 mime="application/json",
                 use_container_width=True
             )
+    else:
+        st.info("No research report generated for this thread yet. Launch a research crew above or ask a question in Thread Chat.")
 
     with tab_trace:
-        run_events = runner.run_sync(event_repo.list_events_by_run(latest_run.id))
+        if latest_run:
+            run_events = runner.run_sync(event_repo.list_events_by_run(latest_run.id))
+        else:
+            run_events = []
         st.subheader(f"Run Telemetry Events ({len(run_events)})")
         for ev in run_events:
             with st.expander(f"[{ev.ts[11:19]}] **{ev.node or 'system'}** — {ev.type}: {ev.payload.get('summary', '')}"):

@@ -22,6 +22,7 @@ from core.llm import set_global_llm
 # Deterministic Checks Unit Tests (Pure Functions)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.critical
 def test_citation_validity_all_valid():
     """Verify citation validity is 1.0 when all cited URLs exist in retrieved sources."""
     results = [
@@ -38,6 +39,7 @@ def test_citation_validity_all_valid():
     assert len(invalid) == 0
 
 
+@pytest.mark.critical
 def test_citation_validity_with_hallucinated_url():
     """Verify citation validity is < 1.0 and flags hallucinated URL not in retrieved sources."""
     results = [

@@ -5,6 +5,7 @@ ONNX-based and fake embedders, hybrid vector + BM25 search with MMR diversificat
 and thread document repositories.
 """
 
+from core.state import RetrievedChunk
 from core.rag.parse import (
     parse_document_bytes,
     stream_and_validate_upload_bytes,
@@ -70,4 +71,5 @@ __all__ = [
     "clear_all_rag_caches",
     "RAG_MIN_SCORE",
     "RAG_MAX_CONTEXT_CHARS",
+    "RetrievedChunk",
 ]

@@ -109,6 +109,7 @@ def test_cache_disabled_flag(temp_cache):
         assert temp_cache.get_sync(query) is None
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_concurrent_access_safety(temp_cache):
     """Ensure multi-threaded/async concurrent access does not corrupt SQLite."""

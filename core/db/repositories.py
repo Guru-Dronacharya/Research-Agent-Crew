@@ -204,6 +204,21 @@ class ThreadRepo:
             await db.execute("UPDATE threads SET updated_at = ? WHERE id = ?;", (now, thread_id))
             await db.commit()
 
+    async def update_thread_settings(self, thread_id: str, settings: Dict[str, Any]) -> Optional[ThreadRecord]:
+        """Update settings_json dictionary for a thread."""
+        now = utc_now_iso()
+        current = await self.get_thread(thread_id)
+        if not current:
+            return None
+        merged = {**current.settings, **settings}
+        async with get_db(self.db_path) as db:
+            await db.execute(
+                "UPDATE threads SET settings_json = ?, updated_at = ? WHERE id = ?;",
+                (json.dumps(merged), now, thread_id)
+            )
+            await db.commit()
+        return await self.get_thread(thread_id)
+
     async def delete_thread(self, thread_id: str) -> bool:
         """Delete thread and cascade delete all messages, runs, events, and checkpoints."""
         run_repo = RunRepo(db_path=self.db_path)
@@ -994,3 +1009,105 @@ class ChunkRepo:
                 deleted = cur.rowcount
             await db.commit()
             return deleted
+
+
+class ChatLockRepo:
+    """Repository managing cross-process DB-backed chat locks with atomic acquisition and staleness checks."""
+
+    def __init__(self, db_path: Optional[str] = None):
+        self.db_path = db_path
+
+    async def acquire_lock(
+        self,
+        thread_id: str,
+        owner_id: str,
+        stale_seconds: Optional[int] = None
+    ) -> bool:
+        """Atomically acquire the chat lock for thread_id.
+
+        Succeeds if no lock exists, or if existing lock's heartbeat is older than
+        HEARTBEAT_STALE_SECONDS, or if already owned by this owner_id.
+        """
+        now = utc_now_iso()
+        stale_sec = stale_seconds if stale_seconds is not None else float(os.environ.get("HEARTBEAT_STALE_SECONDS", "60"))
+        cutoff_dt = datetime.now(timezone.utc) - timedelta(seconds=stale_sec)
+        cutoff_iso = cutoff_dt.isoformat()
+
+        async with get_db(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO chat_locks (thread_id, owner_id, heartbeat_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(thread_id) DO UPDATE
+                SET owner_id = excluded.owner_id,
+                    heartbeat_at = excluded.heartbeat_at
+                WHERE chat_locks.heartbeat_at < ? OR chat_locks.owner_id = excluded.owner_id;
+                """,
+                (thread_id, owner_id, now, cutoff_iso)
+            )
+            await db.commit()
+
+            async with db.execute(
+                "SELECT owner_id, heartbeat_at FROM chat_locks WHERE thread_id = ?;",
+                (thread_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row and row["owner_id"] == owner_id:
+                    return True
+                return False
+
+    async def refresh_heartbeat(self, thread_id: str, owner_id: str) -> bool:
+        """Update heartbeat_at timestamp for a held lock."""
+        now = utc_now_iso()
+        async with get_db(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                UPDATE chat_locks
+                SET heartbeat_at = ?
+                WHERE thread_id = ? AND owner_id = ?;
+                """,
+                (now, thread_id, owner_id)
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def release_lock(self, thread_id: str, owner_id: str) -> bool:
+        """Release the chat lock if owned by owner_id."""
+        async with get_db(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                DELETE FROM chat_locks
+                WHERE thread_id = ? AND owner_id = ?;
+                """,
+                (thread_id, owner_id)
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def get_active_lock(
+        self,
+        thread_id: str,
+        stale_seconds: Optional[int] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Return lock dict if lock is currently active and not stale, else None."""
+        stale_sec = stale_seconds if stale_seconds is not None else float(os.environ.get("HEARTBEAT_STALE_SECONDS", "60"))
+        cutoff_dt = datetime.now(timezone.utc) - timedelta(seconds=stale_sec)
+        cutoff_iso = cutoff_dt.isoformat()
+
+        async with get_db(self.db_path) as db:
+            async with db.execute(
+                """
+                SELECT thread_id, owner_id, heartbeat_at
+                FROM chat_locks
+                WHERE thread_id = ? AND heartbeat_at >= ?;
+                """,
+                (thread_id, cutoff_iso)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    return {
+                        "thread_id": row["thread_id"],
+                        "owner_id": row["owner_id"],
+                        "heartbeat_at": row["heartbeat_at"]
+                    }
+                return None

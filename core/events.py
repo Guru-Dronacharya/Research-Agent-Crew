@@ -5,6 +5,7 @@ payload capping, replay-then-live event streams, and cross-process database tail
 """
 
 import os
+import re
 import json
 import time
 import asyncio
@@ -46,6 +47,18 @@ VALID_EVENT_TYPES = {
 
 SENSITIVE_KEY_SUBSTRINGS = ("api_key", "secret", "password", "token", "authorization")
 
+GROQ_KEY_PATTERN = re.compile(r"gsk_[a-zA-Z0-9]{20,}")
+GOOGLE_KEY_PATTERN = re.compile(r"AIza[0-9A-Za-z-_]{35}")
+
+
+def redact_sensitive_strings(text: str) -> str:
+    """Redact known API key patterns (Groq gsk_..., Google AIza...) from text."""
+    if not isinstance(text, str):
+        return text
+    text = GROQ_KEY_PATTERN.sub("[REDACTED]", text)
+    text = GOOGLE_KEY_PATTERN.sub("[REDACTED]", text)
+    return text
+
 
 def sanitize_and_cap_payload(data: Dict[str, Any], max_bytes: int = EVENT_PAYLOAD_MAX_BYTES) -> Dict[str, Any]:
     """Sanitize sensitive keys and cap payload size to avoid memory bloat.
@@ -63,17 +76,17 @@ def sanitize_and_cap_payload(data: Dict[str, Any], max_bytes: int = EVENT_PAYLOA
             continue
 
         if isinstance(v, str):
-            # Truncate exceptionally long individual strings
-            if len(v) > 2000:
-                cleaned[k] = v[:2000] + "... [truncated]"
+            v_red = redact_sensitive_strings(v)
+            if len(v_red) > 2000:
+                cleaned[k] = v_red[:2000] + "... [truncated]"
             else:
-                cleaned[k] = v
+                cleaned[k] = v_red
         elif isinstance(v, dict):
             cleaned[k] = sanitize_and_cap_payload(v, max_bytes=max_bytes // 2)
         elif isinstance(v, list):
             cleaned[k] = [
                 sanitize_and_cap_payload(item, max_bytes=1000) if isinstance(item, dict)
-                else (item[:500] + "... [truncated]" if isinstance(item, str) and len(item) > 500 else item)
+                else (redact_sensitive_strings(item)[:500] + "... [truncated]" if isinstance(item, str) and len(item) > 500 else redact_sensitive_strings(item) if isinstance(item, str) else item)
                 for item in v[:50]
             ]
         else:

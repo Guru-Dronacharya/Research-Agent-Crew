@@ -37,6 +37,7 @@ def test_resolve_model_role_override():
         assert resolve_model_name("CRITIC_MODEL") == "gemini-critic-flash"
 
 
+@pytest.mark.critical
 def test_resolve_model_missing_gemini_model_raises_config_error():
     """Missing GEMINI_MODEL and role model raises ConfigurationError."""
     with pytest.MonkeyPatch.context() as mp:

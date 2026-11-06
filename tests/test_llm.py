@@ -4,6 +4,7 @@ import pytest
 from core.llm import get_agent_llm, get_critic_llm, set_global_llm, ConfigurationError
 
 
+@pytest.mark.critical
 def test_get_agent_llm_fails_loudly_without_gemini_model(monkeypatch):
     """Verify get_agent_llm raises ConfigurationError when GEMINI_MODEL is unset."""
     set_global_llm(None)
@@ -16,6 +17,7 @@ def test_get_agent_llm_fails_loudly_without_gemini_model(monkeypatch):
     assert "GEMINI_MODEL" in str(exc_info.value)
 
 
+@pytest.mark.slow
 def test_get_agent_llm_fails_loudly_without_gemini_key(monkeypatch):
     """Verify get_agent_llm raises ConfigurationError when GEMINI_API_KEY is missing."""
     set_global_llm(None)

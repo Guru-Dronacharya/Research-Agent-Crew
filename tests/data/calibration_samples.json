@@ -1,0 +1,86 @@
+{
+  "on_topic": [
+    {
+      "query": "How does SQLite WAL mode handle concurrent readers and writers?",
+      "chunk": "In SQLite write-ahead logging (WAL) mode, readers do not block writers and writers do not block readers. Changes are written to a separate WAL file, allowing concurrent read transactions while a single write transaction executes."
+    },
+    {
+      "query": "Explain transformer self-attention mechanism and query key value matrices",
+      "chunk": "Self-attention computes representations by projecting token embeddings into Query, Key, and Value vectors. Attention weights are calculated via scaled dot-product of Queries and Keys followed by softmax normalization."
+    },
+    {
+      "query": "What are the common causes of SSRF vulnerabilities in cloud applications?",
+      "chunk": "Server-Side Request Forgery (SSRF) occurs when an application fetches remote resources using user-supplied URLs without properly resolving hostnames and validating IP addresses against private or loopback ranges."
+    },
+    {
+      "query": "Compare LangGraph state graph cycles with CrewAI role-playing agents",
+      "chunk": "LangGraph models agent workflows as cyclical state graphs with explicit checkpointing and conditional edges, whereas CrewAI organizes agents around sequential or hierarchical team roles and task assignments."
+    },
+    {
+      "query": "What is the boiling point of liquid nitrogen at atmospheric pressure?",
+      "chunk": "Liquid nitrogen boils at 77 Kelvin (-195.8 degrees Celsius or -320.4 degrees Fahrenheit) under standard atmospheric pressure of 1 atm."
+    },
+    {
+      "query": "How do vector databases perform approximate nearest neighbor search using HNSW graphs?",
+      "chunk": "Hierarchical Navigable Small World (HNSW) graphs construct multi-layer skip-list structures over vector data to provide fast, logarithmic-time approximate nearest neighbor (ANN) retrieval with high recall."
+    },
+    {
+      "query": "What is the role of the Critic node in our multi-agent architecture?",
+      "chunk": "The Critic agent audits synthesized research drafts against strict deterministic rubric metrics including citation validity, coverage, and evidence gaps before approving the final report."
+    },
+    {
+      "query": "Explain Python asyncio task cancellation and CancelledError semantics",
+      "chunk": "In Python asyncio, calling task.cancel() causes an asyncio.CancelledError to be raised at the next await point. Code in finally blocks or shielded coroutines executes during cancellation cleanup."
+    },
+    {
+      "query": "What are the benefits of reciprocal rank fusion for hybrid retrieval?",
+      "chunk": "Reciprocal Rank Fusion (RRF) combines ranked lists from dense vector search and sparse BM25 keyword matching without needing score normalization, producing robust hybrid ranking."
+    },
+    {
+      "query": "What is the capital of Iceland?",
+      "chunk": "Reykjavik is the capital and largest city of Iceland, located in southwestern Iceland on the southern shore of Faxafloi bay."
+    }
+  ],
+  "off_topic": [
+    {
+      "query": "How does SQLite WAL mode handle concurrent readers and writers?",
+      "chunk": "Baking sourdough bread requires creating a wild yeast starter by mixing equal parts flour and warm water and allowing fermentation for seven days."
+    },
+    {
+      "query": "Explain transformer self-attention mechanism and query key value matrices",
+      "chunk": "The Roman Colosseum was completed in 80 AD under Emperor Titus and could hold an estimated 50,000 spectators for gladiatorial contests."
+    },
+    {
+      "query": "What are the common causes of SSRF vulnerabilities in cloud applications?",
+      "chunk": "A standard violin has four strings tuned in perfect fifths: G, D, A, and E. The bow is typically made of pernambuco wood with horsehair."
+    },
+    {
+      "query": "Compare LangGraph state graph cycles with CrewAI role-playing agents",
+      "chunk": "Photosynthesis converts light energy, usually from the Sun, into chemical energy that can be later released to fuel organisms' metabolic activities."
+    },
+    {
+      "query": "What is the boiling point of liquid nitrogen at atmospheric pressure?",
+      "chunk": "The Mona Lisa is a half-length portrait painting by Italian artist Leonardo da Vinci, considered an archetypal masterpiece of the Italian Renaissance."
+    },
+    {
+      "query": "How do vector databases perform approximate nearest neighbor search using HNSW graphs?",
+      "chunk": "The speed of light in vacuum is exactly 299,792,458 meters per second, a universal physical constant denoted by the letter c."
+    },
+    {
+      "query": "What is the role of the Critic node in our multi-agent architecture?",
+      "chunk": "Mount Kilimanjaro in Tanzania is a dormant volcano with three volcanic cones: Kibo, Mawenzi, and Shira. It is the highest mountain in Africa."
+    },
+    {
+      "query": "Explain Python asyncio task cancellation and CancelledError semantics",
+      "chunk": "Traditional sushi uses seasoned vinegared rice combined with raw seafood, vegetables, and nori seaweed rolled using a bamboo mat."
+    },
+    {
+      "query": "What are the benefits of reciprocal rank fusion for hybrid retrieval?",
+      "chunk": "The Great Wall of China is a series of fortifications that were built across the historical northern borders of ancient Chinese states."
+    },
+    {
+      "query": "What is the capital of Iceland?",
+      "chunk": "Jupiter is the fifth planet from the Sun and the largest in the Solar System, an enormous gas giant with a mass more than two and a half times that of all other planets combined."
+    }
+  ]
+}

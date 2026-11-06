@@ -89,6 +89,7 @@ async def test_thread_crud_and_autotitle_without_llm(tmp_path):
     assert len(all_threads) == 2
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_cascade_delete_and_checkpoints_purged(tmp_path, monkeypatch):
     """Deleting a thread cascades to runs/messages/events and purges checkpoints & writes via adelete_thread without touching other threads."""
@@ -169,6 +170,7 @@ async def test_cascade_delete_and_checkpoints_purged(tmp_path, monkeypatch):
         assert t2_writes == 1
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_concurrent_writers_do_not_corrupt_data(tmp_path):
     """Concurrent writers appending messages and events under SQLite WAL mode succeed."""
